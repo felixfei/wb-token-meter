@@ -1,5 +1,6 @@
 @echo off
 rem wb-token-meter launcher: run the built app from this repo (out/ must exist)
+rem All app settings stay inside this project folder (.\.userData), nothing on C:
 cd /d "%~dp0"
 if not exist "out\main\index.js" (
   echo [!] out\main\index.js not found. Build first:
@@ -13,4 +14,4 @@ if not exist "node_modules\electron\dist\electron.exe" (
   pause
   exit /b 1
 )
-start "" "%~dp0node_modules\electron\dist\electron.exe" .
+start "" "%~dp0node_modules\electron\dist\electron.exe" . --user-data-dir="%~dp0.userData"
