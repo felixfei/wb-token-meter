@@ -78,17 +78,18 @@ export function hasQuota(kind: SourceKind): boolean {
 
 /**
  * 数据源在界面上的顺序 —— 面板分段按钮与托盘菜单共用同一份，免得两边点错位。
- * 按「账本性质」排：先是带积分的（WorkBuddy 积分 + token，Qoder CN 只有积分），
- * 接着是一整排只有 token 的，最后是唯一联网查额度的那个。
+ * 前四位直接显示为按钮，其余收进「更多」。WorkBuddy 与 DeepSeek Harness 固定在
+ * 前两位（2026-10-01 用户指定，DSH 是本机的主力源）；其余按「账本性质」排：
+ * 带积分的（Qoder CN 只有积分）在前，只有 token 的随后，最后是唯一联网查额度的那个。
  */
 export const SOURCE_ORDER: SourceKind[] = [
   'workbuddy',
+  'dsh',
   'qoder',
   'kimi',
   'zcode',
   'mimo',
   'reasonix',
-  'dsh',
   'opencode'
 ]
 
@@ -102,6 +103,16 @@ export function sourceLabel(kind: SourceKind): string {
   if (kind === 'dsh') return 'DeepSeek Harness'
   if (kind === 'opencode') return 'OpenCode Go'
   return 'Kimi Code'
+}
+
+/**
+ * 数据源在面板切换行上的短标签。
+ * 顶栏一行要塞四个按钮 + 刷新，全名（DeepSeek Harness）放不下 —— 缩写省字符，
+ * 托盘菜单与「更多」下拉里空间充裕，仍用全名（sourceLabel）。
+ */
+export function sourceSwitchLabel(kind: SourceKind): string {
+  if (kind === 'dsh') return 'DSH'
+  return sourceLabel(kind)
 }
 
 /* ------------------------------------------------------------ 外观 */

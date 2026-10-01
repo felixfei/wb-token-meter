@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { CAPSULE_THEME_ORDER } from '../shared/capsule'
 import { collectSnapshot, type ParseCache } from '../shared/collector'
 import { collectDshSnapshot, type DshParseCache } from '../shared/dsh-collector'
-import { SOURCE_ORDER, sourceLabel } from '../shared/format'
+import { SOURCE_ORDER, sourceSwitchLabel } from '../shared/format'
 import { collectKimiSnapshot, type KimiParseCache } from '../shared/kimi-collector'
 import { collectMimoSnapshot } from '../shared/mimo-collector'
 import { collectQoderSnapshot, type QoderParseCache } from '../shared/qoder-collector'
@@ -604,7 +604,7 @@ function bootstrap(): void {
           for (const target of SOURCE_ORDER) {
             if (target === sourceBefore) continue
             // 前三个源就是按钮本身，其余收在「更多」下拉里 —— 两条路径都要真的点一遍
-            const label = JSON.stringify(sourceLabel(target))
+            const label = JSON.stringify(sourceSwitchLabel(target))
             await win.webContents.executeJavaScript(
               `(() => {
                  const root = document.querySelector('.source-switch')

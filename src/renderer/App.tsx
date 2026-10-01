@@ -27,6 +27,7 @@ import {
   shiftDays,
   SOURCE_ORDER,
   sourceLabel,
+  sourceSwitchLabel,
   startOfToday,
   THEME_ORDER,
   themeLabel,
@@ -525,7 +526,7 @@ function SourceSwitch({
           disabled={disabled}
           onClick={() => pick(kind)}
         >
-          {sourceLabel(kind)}
+          {sourceSwitchLabel(kind)}
         </button>
       ))}
       <button
@@ -536,7 +537,7 @@ function SourceSwitch({
         aria-expanded={open}
         onClick={() => setOpen(!open)}
       >
-        {inTail ? sourceLabel(value) : '更多'}
+        {inTail ? sourceSwitchLabel(value) : '更多'}
         <i className="caret" aria-hidden="true" />
       </button>
       {open ? (
