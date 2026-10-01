@@ -19,6 +19,9 @@ OpenCode Go 更特别：它连 token 都不给看，只有订阅额度的占用�
 > 出站请求只有两个：`GET https://opencode.ai/zen/go/v1/usage`（带本机凭证读来的 key，
 > 拿那三个百分比）和更新检查（去本仓库的 Release 拉 `latest.yml`）—— 都不发送任何本地数据。
 
+改代码前先看 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)：分层结构、模块职责、数据流与
+关键取舍都在那里（含两张架构图）；命令、本机环境坑与发版流程见 [AGENTS.md](AGENTS.md)。
+
 ## 版本与更新
 
 面板底部常驻一条**底轨**（在滚动区之外，始终看得见）：左边是当前版本号，

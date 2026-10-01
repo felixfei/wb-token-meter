@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="100%" viewBox="0 0 1200 470" role="img" font-family="system-ui, 'Segoe UI', 'Microsoft YaHei', sans-serif">
+<title>wb-token-meter 数据流图</title>
+<desc>采集侧：外部数据经采集器解析、归一成 CallRecord、聚合为 Snapshot；交付侧：主进程 refresh 扇出广播给主面板、桌面胶囊与托盘；底部是设置反向链路。</desc>
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </marker>
+</defs>
+
+<text x="24" y="26" font-size="16" font-weight="500" fill="#2C2C2A">数据流：一份 Snapshot 扇出三处，一条反向链路回到采集</text>
+
+<rect x="24" y="42" width="1126" height="26" rx="6" fill="#E6F1FB" stroke="#85B7EB" stroke-width="0.5"/>
+<text x="38" y="55" font-size="12" font-weight="500" fill="#042C53" dominant-baseline="central">采集侧 · 只读，20 秒一轮（切源 / 手动刷新 / 关掉窗口后的下一轮立即重采）</text>
+
+<g>
+  <rect x="24" y="76" width="205" height="84" rx="8" fill="#E6F1FB" stroke="#378ADD" stroke-width="0.5"/>
+  <text x="38" y="100" font-size="12.5" font-weight="500" fill="#042C53" dominant-baseline="central">① 外部数据</text>
+  <text x="38" y="122" font-size="12" fill="#185FA5" dominant-baseline="central">7 个本地目录</text>
+  <text x="38" y="142" font-size="12" fill="#185FA5" dominant-baseline="central">OpenCode Go 走接口</text>
+</g>
+<g>
+  <rect x="254" y="76" width="205" height="84" rx="8" fill="#E6F1FB" stroke="#378ADD" stroke-width="0.5"/>
+  <text x="268" y="100" font-size="12.5" font-weight="500" fill="#042C53" dominant-baseline="central">② 采集器解析</text>
+  <text x="268" y="122" font-size="12" fill="#185FA5" dominant-baseline="central">逐文件缓存</text>
+  <text x="268" y="142" font-size="12" fill="#185FA5" dominant-baseline="central">mtime+size 命中即复用</text>
+</g>
+<g>
+  <rect x="484" y="76" width="205" height="84" rx="8" fill="#E6F1FB" stroke="#378ADD" stroke-width="0.5"/>
+  <text x="498" y="100" font-size="12.5" font-weight="500" fill="#042C53" dominant-baseline="central">③ 归一 CallRecord</text>
+  <text x="498" y="122" font-size="12" fill="#185FA5" dominant-baseline="central">计费键去重</text>
+  <text x="498" y="142" font-size="12" fill="#185FA5" dominant-baseline="central">子代理并入父会话</text>
+</g>
+<g>
+  <rect x="714" y="76" width="205" height="84" rx="8" fill="#E6F1FB" stroke="#378ADD" stroke-width="0.5"/>
+  <text x="728" y="100" font-size="12.5" font-weight="500" fill="#042C53" dominant-baseline="central">④ 聚合</text>
+  <text x="728" y="122" font-size="12" fill="#185FA5" dominant-baseline="central">日 / 模型 / 项目</text>
+  <text x="728" y="142" font-size="12" fill="#185FA5" dominant-baseline="central">会话排行 / 活跃会话</text>
+</g>
+<g>
+  <rect x="944" y="76" width="205" height="84" rx="8" fill="#B5D4F4" stroke="#185FA5" stroke-width="0.5"/>
+  <text x="958" y="100" font-size="12.5" font-weight="500" fill="#042C53" dominant-baseline="central">⑤ Snapshot</text>
+  <text x="958" y="122" font-size="12" fill="#0C447C" dominant-baseline="central">shared/types 契约</text>
+  <text x="958" y="142" font-size="12" fill="#0C447C" dominant-baseline="central">八个源同形</text>
+</g>
+
+<path d="M229 118 H250" fill="none" stroke="#5F5E5A" stroke-width="1.2" marker-end="url(#arrow)"/>
+<path d="M459 118 H480" fill="none" stroke="#5F5E5A" stroke-width="1.2" marker-end="url(#arrow)"/>
+<path d="M689 118 H710" fill="none" stroke="#5F5E5A" stroke-width="1.2" marker-end="url(#arrow)"/>
+<path d="M919 118 H940" fill="none" stroke="#5F5E5A" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+<rect x="24" y="186" width="1126" height="26" rx="6" fill="#E6F1FB" stroke="#85B7EB" stroke-width="0.5"/>
+<text x="38" y="199" font-size="12" font-weight="500" fill="#042C53" dominant-baseline="central">交付侧 · 一次 refresh 扇出三处；网络请求不阻塞首帧，拉取成功后回调再采一次</text>
+
+<g>
+  <rect x="24" y="220" width="265" height="84" rx="8" fill="#B5D4F4" stroke="#185FA5" stroke-width="0.5"/>
+  <text x="38" y="244" font-size="12.5" font-weight="500" fill="#042C53" dominant-baseline="central">refresh() 编排</text>
+  <text x="38" y="266" font-size="12" fill="#0C447C" dominant-baseline="central">按 source 选一个采集器</text>
+  <text x="38" y="286" font-size="12" fill="#0C447C" dominant-baseline="central">整段 try/catch</text>
+</g>
+<g>
+  <rect x="314" y="220" width="265" height="84" rx="8" fill="#B5D4F4" stroke="#185FA5" stroke-width="0.5"/>
+  <text x="328" y="244" font-size="12.5" font-weight="500" fill="#042C53" dominant-baseline="central">三路广播</text>
+  <text x="328" y="266" font-size="12" fill="#0C447C" dominant-baseline="central">snapshot / settings / update</text>
+  <text x="328" y="286" font-size="12" fill="#0C447C" dominant-baseline="central">webContents.send</text>
+</g>
+<g>
+  <rect x="604" y="220" width="265" height="84" rx="8" fill="#E6F1FB" stroke="#378ADD" stroke-width="0.5"/>
+  <text x="618" y="244" font-size="12.5" font-weight="500" fill="#042C53" dominant-baseline="central">主面板 · 桌面胶囊</text>
+  <text x="618" y="266" font-size="12" fill="#185FA5" dominant-baseline="central">同一份 Snapshot 各自渲染</text>
+  <text x="618" y="286" font-size="12" fill="#185FA5" dominant-baseline="central">渲染层不做任何记账</text>
+</g>
+<g>
+  <rect x="894" y="220" width="265" height="84" rx="8" fill="#F1EFE8" stroke="#888780" stroke-width="0.5"/>
+  <text x="908" y="244" font-size="12.5" font-weight="500" fill="#2C2C2A" dominant-baseline="central">托盘</text>
+  <text x="908" y="266" font-size="12" fill="#5F5E5A" dominant-baseline="central">进度环 + 四组子菜单</text>
+  <text x="908" y="286" font-size="12" fill="#5F5E5A" dominant-baseline="central">签名去重后才重建</text>
+</g>
+
+<path d="M293 262 H310" fill="none" stroke="#5F5E5A" stroke-width="1.2" marker-end="url(#arrow)"/>
+<path d="M583 262 H600" fill="none" stroke="#5F5E5A" stroke-width="1.2" marker-end="url(#arrow)"/>
+<path d="M873 262 H890" fill="none" stroke="#5F5E5A" stroke-width="1.2" marker-end="url(#arrow)"/>
+<path d="M430 304 V332" fill="none" stroke="#888780" stroke-width="1.2" stroke-dasharray="4 4" marker-end="url(#arrow)"/>
+
+<g>
+  <rect x="24" y="336" width="1126" height="70" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+  <text x="40" y="358" font-size="12.5" font-weight="500" fill="#2C2C2A" dominant-baseline="central">反向链路 · 三处设置入口（托盘菜单 / 面板 / 胶囊）全部收口到 patchSettings()</text>
+  <text x="40" y="380" font-size="12" fill="#5F5E5A" dominant-baseline="central">原子写 JSON → 广播 settings → floatWindow.syncFromSettings + tray.refresh；换数据源即刻重采一次；改 theme 时同步 nativeTheme.themeSource 与窗口底色</text>
+  <text x="40" y="398" font-size="12" fill="#5F5E5A" dominant-baseline="central">网络旁路：OpenCode Go 与 models.dev 先在首帧用缓存画出来，拉取成功后回调 refresh()，水位立刻跟上</text>
+</g>
+
+<text x="24" y="430" font-size="12" fill="#5F5E5A">采集失败只写一份 smoke 报告并留在原快照上，绝不中断 20 秒的轮询 —— WorkBuddy 正在写库时尤其不能停。</text>
+</svg>
