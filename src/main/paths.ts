@@ -73,7 +73,8 @@ export function mimoCacheDir(): string {
 }
 
 /**
- * OpenCode 的数据目录。auth.json 就在这里，OpenCode Go 的额度查询从里面取凭证。
+ * OpenCode 引擎的数据目录。用量库 opencode.db 与凭证 auth.json 都在这里 ——
+ * 桌面端（engine sidecar）与 CLI 共用同一份。
  * 注意它是 mimocode 在 ~/.local/share 下的兄弟目录，别混。
  */
 export function opencodeDir(): string {
@@ -82,8 +83,16 @@ export function opencodeDir(): string {
   return join(homedir(), '.local', 'share', 'opencode')
 }
 
+/** OpenCode 引擎的缓存目录，模型目录 models.json 在这里（算上下文窗口用） */
+export function opencodeCacheDir(): string {
+  const override = process.env['WB_TOKEN_METER_OPENCODE_CACHE_DIR']
+  if (override) return override
+  return join(homedir(), '.cache', 'opencode')
+}
+
 /**
- * Reasonix 的数据目录（桌面端与 CLI 共用这一份）。
+ * Reasonix 旧版数据目录（2026-06 前的桌面端与 CLI 共用这一份；新版桌面端不再写
+ * 这里，改记 reasonixStatsDir()，两本账都要读）。
  * 用量流水是 <dir>/usage.jsonl，会话元数据在 <dir>/sessions/*.meta.json。
  * 同目录下的 config.json 存着明文 apiKey，采集器刻意不碰。
  */
@@ -93,11 +102,61 @@ export function reasonixDir(): string {
   return join(homedir(), '.reasonix')
 }
 
+/**
+ * Reasonix 桌面端新版（2026-06 起）的按天流水目录。新版引擎把账从 ~/.reasonix
+ * 挪进了 Electron 标准数据目录（Windows 是 %APPDATA%\reasonix），按天一份 jsonl。
+ * app.getPath('appData') 给的就是那个标准基址，跨平台与 Reasonix 自己的落盘一致。
+ */
+export function reasonixStatsDir(): string {
+  const override = process.env['WB_TOKEN_METER_REASONIX_STATS_DIR']
+  if (override) return override
+  return join(app.getPath('appData'), 'reasonix', 'stats')
+}
+
 /** DeepSeek Harness 的数据目录；会话日志在 <dir>/sessions/<工作目录>/<会话>/ 下 */
 export function dshDir(): string {
   const override = process.env['WB_TOKEN_METER_DSH_DIR']
   if (override) return override
   return join(homedir(), '.dsh')
+}
+
+/**
+ * TRAE SOLO CN（TraeWork CN）的数据目录 —— 用量库 database.db 就在这一层。
+ *
+ * 它用的是 Electron 的标准 userData 基址，目录名取 product.json 里的
+ * win32NameVersion（'TraeWork CN' 是应用名，数据目录却是 'TRAE SOLO CN'，
+ * 两者不一致，别照名字猜）。库本身是 SQLCipher 4 加密的，
+ * 密钥只能从运行中的进程内存里取，见 shared/traecn-collector.ts 的说明。
+ */
+export function traeCnDir(): string {
+  const override = process.env['WB_TOKEN_METER_TRAECN_DIR']
+  if (override) return override
+  return join(app.getPath('appData'), 'TRAE SOLO CN', 'ModularData', 'ai-agent')
+}
+
+/** 用量库的完整路径 —— 取密钥（按文件问谁锁着它）与采集都认它 */
+export function traeCnDbPath(): string {
+  return join(traeCnDir(), 'database.db')
+}
+
+/**
+ * TRAE SOLO CN 的**模型目录** —— VS Code 通用的全局状态库，明文 SQLite。
+ *
+ * 注意它不在 traeCnDir() 底下：那个是 ai-agent 的私有目录（SQLCipher 账本
+ * 在那里），而模型目录由 Electron 宿主写在标准 userData 的 User\globalStorage 下。
+ * 两个库分属两个进程（渲染进程 vs ai-agent sidecar），所以「账本锁在哪个进程」
+ * 与「目录能不能读」是两件独立的事 —— 目录这一半不需要扫内存拿密钥。
+ */
+export function traeCnStatePath(): string {
+  const override = process.env['WB_TOKEN_METER_TRAECN_STATE']
+  if (override) return override
+  return join(
+    app.getPath('appData'),
+    'TRAE SOLO CN',
+    'User',
+    'globalStorage',
+    'state.vscdb'
+  )
 }
 
 /**

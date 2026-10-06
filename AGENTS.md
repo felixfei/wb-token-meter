@@ -257,7 +257,7 @@ git tag -a vX.Y.Z -m "vX.Y.Z：中文摘要"
 **但要带一个环境变量**：
 
 ```bash
-WB_TOKEN_METER_FAKE_UPDATE=0.9.0 env -u ELECTRON_RUN_AS_NODE \
+WB_TOKEN_METER_FAKE_UPDATE=<当前版本号> env -u ELECTRON_RUN_AS_NODE \
   WB_TOKEN_METER_SMOKE=1 WB_TOKEN_METER_SMOKE_EXIT=1 \
   node_modules/electron/dist/electron.exe . --user-data-dir=".workbuddy/tmp/smoke-shots"
 ```
@@ -278,10 +278,11 @@ WB_TOKEN_METER_FAKE_UPDATE=0.9.0 env -u ELECTRON_RUN_AS_NODE \
 - `src/shared/` 是**不依赖 Electron 的纯 Node 逻辑**（解析、聚合、口径换算、格式化），
   能在 `scripts/core-test.ts` 里 headless 跑；`src/main/` 里也有可测的部分
   （`opencode-usage.ts`、`modelsdev.ts`）。
-- **改解析或聚合就补 `scripts/core-test.ts` 的用例**（当前 390 项）。
+- **改解析或聚合就补 `scripts/core-test.ts` 的用例**（项数随环境浮动 —— 带真实数据的
+  断言在 CI 条件下整段跳过，所以 565 / 484 都对，以自检输出的总数为准）。
   涉及网络的用例一律打在本地 mock server 上，只有「真实数据」那一段碰真实环境。
 - **改数据源要动的地方**：`src/shared/<源>-collector.ts`、`src/shared/types.ts` 的源定义、
-  `src/main/index.ts` 的接线、以及 `core-test.ts` 里「七个数据源互不影响」那一段。
+  `src/main/index.ts` 的接线、以及 `core-test.ts` 里「九个数据源互不影响」那一段。
 - **改设置项**：`src/shared/types.ts` 的类型 + `src/main/settings.ts` 的默认值与校验。
   老数据文件靠合并默认值兼容，不用写迁移。
 
@@ -322,8 +323,10 @@ WB_TOKEN_METER_FAKE_UPDATE=0.9.0 env -u ELECTRON_RUN_AS_NODE \
 记录纸 / 深靛 / 琥珀夜光 / 碳黑）：它贴在别人的桌面上，用户经常想让胶囊和面板不一样，
 所以别把它「统一」进 `nativeTheme`。那一档靠窗口启动参数 `--wbm-capsule-theme=`
 传给 preload，preload 在样式表之前写 `<html data-capsule>`；`float.css` 只认
-`data-capsule`，不认 `data-theme`。深色三档的 12 个共用令牌必须和 `styles.css`
-的深浅两块**逐字节相同**（`core-test` 盯着这一条）。
+`data-capsule`，不认 `data-theme`。**paper 与 ink 两档**的 12 个共用令牌必须分别和
+`styles.css` 的浅色块 / 深色块**逐值相同**（`core-test` 盯着这一条）。
+amber / carbon 有自己整套色板（`--pen` 就是琥珀/红，本来就 ≠ 面板深色那支），
+**别去「统一」它们**。
 
 ### 6.3 网络请求只在主进程
 
@@ -356,6 +359,12 @@ WB_TOKEN_METER_FAKE_UPDATE=0.9.0 env -u ELECTRON_RUN_AS_NODE \
 - **档位表里必须含当前值**，否则那一列圆点**一个都不亮**（不透明度的默认值 0.94 就不在
   `OPACITY_OPTIONS` 里）。别把缺的那个值写死进表，按 `opacityOptions()` 那样插进有序位置 ——
   写死只救得了那一个值。
+- **透明窗口绝不 resize**（实测：setBounds 后 DWM 滞留旧画面 100~200ms、切换瞬间夹一帧
+  全空，这就是「收起卡片闪一下」的根因）。窗口恒为展开尺寸，收起态用 `setShape`
+  裁到胶囊那块 —— region 即时生效、纹理不变，怎么切都无缝。收起态的锚位冻结在
+  右下（`floatWindowBounds` 的 shapeMode 分支），跨中线拖拽不换边，region 与 DOM
+  锚位才不会错开。solid 降级模式没有这套待遇，保留 resize + 「内容先切、画完一帧
+  再缩窗」的握手（`float:content-settled`）。
 
 ### 6.5 各数据源的 token 口径不一样
 
@@ -364,7 +373,7 @@ WB_TOKEN_METER_FAKE_UPDATE=0.9.0 env -u ELECTRON_RUN_AS_NODE \
 | 源 | input | 缓存命中 |
 | --- | --- | --- |
 | WorkBuddy / Kimi Code / ZCode / Reasonix | **含**缓存读 | 各自的 cache 字段 |
-| Xiaomi MiMo / DeepSeek Harness | **不含**，要手动加回 `cache.read` / `cacheWrite` | 同左 |
+| Xiaomi MiMo / DeepSeek Harness / OpenCode | **不含**，要手动加回 `cache.read` / `cacheWrite` | 同左 |
 
 算错不会报错，只会让数字整体偏。同理，Qoder CN 的账本里**根本没有 token**
 （服务端只回积分与水位比例），那不是「读不到」。

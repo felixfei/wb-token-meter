@@ -102,10 +102,23 @@ export interface Totals extends TokenBundle {
  * 数据源。各边的账本口径都不同，界面必须知道自己在看哪一本：
  * WorkBuddy 有积分（token 只是副产品），Qoder CN 有积分但**没有 token**
  * （服务端只回积分与上下文水位），Kimi Code / ZCode / MiMo / Reasonix /
- * DeepSeek Harness 只有 token，OpenCode Go 连 token 都没有 ——
- * 只有订阅额度的占用比例，而且还是联网查的。
+ * DeepSeek Harness / OpenCode / TRAE SOLO CN 只有 token，OpenCode Go 连 token
+ * 都没有 —— 只有订阅额度的占用比例，而且还是联网查的。
+ * `opencode-desktop` 是 OpenCode 桌面端（opencode 引擎，与 CLI 共用本地库）
+ * 的用量，与联网查额度的 `opencode`（OpenCode Go）是两本账。
+ * `traecn` 是唯一**要先去别的进程内存里取密钥**的源（SQLCipher 加密库）。
  */
-export type SourceKind = 'workbuddy' | 'qoder' | 'kimi' | 'zcode' | 'mimo' | 'reasonix' | 'dsh' | 'opencode'
+export type SourceKind =
+  | 'workbuddy'
+  | 'qoder'
+  | 'kimi'
+  | 'zcode'
+  | 'mimo'
+  | 'reasonix'
+  | 'dsh'
+  | 'traecn'
+  | 'opencode-desktop'
+  | 'opencode'
 
 export interface SnapshotSource {
   /** 数据根目录 */
@@ -130,7 +143,28 @@ export interface Snapshot {
   warnings: string[]
   /** 只有 OpenCode Go 会填：订阅额度水位，其它源没有这一层 */
   quota?: QuotaInfo
+  /**
+   * 这一份快照**还没读完**，正在补采。
+   *
+   * 为什么需要它：`traecn` 的用量库要扫 TraeWork 进程内存才拿得到密钥（~680MB /
+   * 21 秒），而首屏不能等 —— 主进程先把「空账 + 密钥没取到」这张快照推上去，
+   * 扫完再推真的那张。两张都是合法的 Snapshot，光看内容分不出「读完了，确实是 0」
+   * 和「还没读到，暂且是 0」。这个字段就是那个区别。
+   *
+   * 只有首屏 / 切源那一刻会为 true，稳定态恒为 undefined。
+   */
+  pending?: PendingReason
 }
+
+/**
+ * 「还没读完」的原因。界面据此说人话，而不是让用户对着一个 0 猜。
+ *
+ * - `key-scan`：正在从 TraeWork 进程内存里捞数据库密钥（只在 traecn 出现，
+ *   且只在启动后的第一拍）。这是唯一需要解释「为什么要等」的档位 —— 其余源
+ *   都是毫秒级，慢一分钟用户会以为卡死了。
+ * - `collect`：主进程正在解密 / 聚合这一轮。
+ */
+export type PendingReason = 'key-scan' | 'collect'
 
 /* ------------------------------------------------ OpenCode Go 订阅额度 */
 
@@ -294,7 +328,10 @@ export interface FloatState {
   loaded: boolean
   /** 卡片是否展开 —— 渲染层要靠它决定画胶囊还是胶囊 + 卡片 */
   expanded: boolean
-  /** 卡片朝上还是朝下；收起态恒为 up */
+  /**
+   * 卡片朝上还是朝下。形状模式下收起态**沿用展开前的那一组** —— 渲染层要靠它
+   * 把胶囊摆到 region 上；solid 降级模式收起时恒为 up。
+   */
   side: FloatCardSide
   /**
    * 胶囊贴窗口的哪一侧（true = 贴右）。
@@ -302,5 +339,10 @@ export interface FloatState {
    * 渲染层只负责照摆 —— 计算只留一处，不然两边各算一次就会错位。
    */
   alignRight: boolean
+  /**
+   * 胶囊在屏幕上的位置。形状模式（透明窗口恒为展开尺寸）下窗口 bounds 不随
+   * 收起/展开变化，核对「胶囊没漂」得看它，不能看 bounds。
+   */
+  capsule: { x: number; y: number } | null
   bounds: { x: number; y: number; width: number; height: number } | null
 }

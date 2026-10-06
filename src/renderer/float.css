@@ -12,9 +12,10 @@
  * 一共四套：paper（记录纸）/ ink（深靛）/ amber（琥珀夜光）/ carbon（碳黑）。
  * 属性由 preload 在样式表之前写好（见 preload/index.ts），首帧就是对的颜色。
  *
- * ink 与 paper 里那 11 个基础色（--paper/--sheet/--ink/--ink-2/--ink-3/--pen/
- * --warn/--alarm/--d-in/--d-out/--track）必须和 styles.css 的深色块 / 浅色块
- * **逐字节相同** —— 两个窗口是同一台仪器，各调各的迟早会跑偏。core-test 盯着这一条。
+ * ink 与 paper 里那 12 个基础色（--paper/--sheet/--ink/--ink-2/--ink-3/--pen/
+ * --warn/--alarm/--d-in/--d-cache/--d-out/--track）必须和 styles.css 的深色块 /
+ * 浅色块 **逐字节相同** —— 两个窗口是同一台仪器，各调各的迟早会跑偏。
+ * core-test 盯着这一条（amber / carbon 有自己的整套色板，不在这条约束里）。
  */
 :root {
   color-scheme: light;
@@ -180,9 +181,16 @@ body {
  * 两个子元素的高度都由 float.tsx 从布局常数写死 —— 这里不能给 height: 100%，
  * 否则两个都会去抢整摞的高度。
  */
+/*
+ * justify-content: flex-end 是收起握手的一半 —— 卡片拆掉之后、窗口缩起来之前，
+ * 栈里只剩胶囊，这一行把它钉在缩窗后会落定的那条边上（side=up 钉底、
+ * column-reverse 的 side=down 钉顶），中间帧不会先跳一下再弹回来。
+ * 展开态内容正好填满窗口，这一行不起任何作用。
+ */
 .float-stack {
   display: flex;
   flex-direction: column;
+  justify-content: flex-end;
   height: 100%;
 }
 
@@ -413,6 +421,17 @@ body {
 .card-icon.theme {
   font-size: 10px;
   padding: 0 6px;
+}
+
+/*
+ * 置顶开关。两态不换图标、只换颜色深浅 ——
+ * 10px 的图钉在两种画法之间差的那点细节，眼睛在这个尺寸上根本分不出来，
+ * 而「按下去深了」是一定看得见的。
+ */
+.card-icon.pin[data-on='true'] {
+  color: var(--pen);
+  border-color: var(--card-line);
+  background: var(--track);
 }
 
 /* 主题色块：左半是这一档的纸、右半是它的记录笔 —— 一眼看出这套配色长什么样 */

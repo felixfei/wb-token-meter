@@ -8,8 +8,10 @@ import { collectDshSnapshot, type DshParseCache } from '../shared/dsh-collector'
 import { SOURCE_ORDER, sourceSwitchLabel } from '../shared/format'
 import { collectKimiSnapshot, type KimiParseCache } from '../shared/kimi-collector'
 import { collectMimoSnapshot } from '../shared/mimo-collector'
+import { collectOpencodeSnapshot } from '../shared/opencode-collector'
 import { collectQoderSnapshot, type QoderParseCache } from '../shared/qoder-collector'
 import { collectReasonixSnapshot, type ReasonixParseCache } from '../shared/reasonix-collector'
+import { collectTraeCnSnapshot, probeTraeCnKey, traeCnFileStamp } from '../shared/traecn-collector'
 import { collectZcodeSnapshot } from '../shared/zcode-collector'
 import type {
   AppInfo,
@@ -32,14 +34,20 @@ import {
   loadRenderer,
   mimoCacheDir,
   mimoDataDir,
+  opencodeCacheDir,
   opencodeDir,
   preloadPath,
   qoderDir,
   reasonixDir,
+  reasonixStatsDir,
+  traeCnDbPath,
+  traeCnDir,
+  traeCnStatePath,
   workbuddyDir,
   zcodeDir
 } from './paths'
 import { DEFAULT_SETTINGS, SettingsStore } from './settings'
+import { readTraeCnKey, type TraeCnKeyProbe } from './traecn-key'
 import { TrayController, type MenuChoice } from './tray'
 import { UpdateController } from './updater'
 
@@ -54,6 +62,15 @@ const SMOKE_EXIT = process.env['WB_TOKEN_METER_SMOKE_EXIT'] === '1'
 // ——实测过的最常见诱因是 Chromium 的网络服务进程崩溃——这些 await 会永久挂起，
 // 进程既不报错也不退出，调用方只能一直等。正常一轮约 40 秒，给到 2 分钟足够宽松。
 const SMOKE_TIMEOUT_MS = 120_000
+
+/**
+ * 首屏那一拍延后多久量。
+ *
+ * 要够早 —— 早到 traecn 还在扫密钥（那台机器实测 ~21 秒），早到能看见骨架；
+ * 也要够晚 —— 晚到首帧真的画出来了（否则量到的是空白页，不是「画成了 0」）。
+ * 800ms 落在两者之间：首屏那一下 refresh() 是同步的，早于它画不出东西。
+ */
+const SMOKE_FIRST_PAINT_MS = 800
 
 // 自检时给更新检查注入一个假版本号：既不真去打网络，又能让更新界面被完整渲染到。
 // 必须在 ensureUpdater() 之前设 —— UpdateController 在构造时就把这个值读走了。
@@ -114,6 +131,50 @@ const qoderCache: QoderParseCache = new Map()
 const reasonixCache: ReasonixParseCache = new Map()
 const dshCache: DshParseCache = new Map()
 
+/**
+ * TRAE SOLO CN 的数据库密钥。**必须缓存**：唯一能取到它的办法是扫那些锁着
+ * 用量库的进程的内存（实测 ~680MB / 21 秒），而 20 秒一次的轮询扛不住这个代价。
+ * 同一份 TraeWork 不重启，密钥就一直有效 —— 所以只有第 1 页 HMAC 验不过
+ * （App 重启换了钥）才重扫，见 ensureTraeCnKey()。
+ */
+let traeCnKey: Buffer | null = null
+/** 上一次取密钥的结果（含「谁锁着这个库」），用来给「取不到」配一条具体的提示 */
+let traeCnKeyProbe: TraeCnKeyProbe | null = null
+let traeCnKeyScan: Promise<void> | null = null
+let traeCnKeyCheckedAt = 0
+
+/** 取密钥失败后的冷却：App 没开时每分钟撞一次就够了，别把轮询变成扫描器 */
+const TRAECN_KEY_RETRY_MS = 60_000
+
+/**
+ * TRAE SOLO CN 的快照缓存：db + -wal 的文件戳没变就整份复用（见 refresh() 的
+ * traecn 分支）。只缓存「有钥」时采的那份 —— 没钥的空账本来就不花钱，而且
+ * 钥从无到有的那一拍必须真的重采，不能被上一份「没钥」的空账挡住。
+ */
+let traeCnStampCache: { stamp: string; snapshot: Snapshot } | null = null
+
+function ensureTraeCnKey(force = false): Promise<void> {
+  if (traeCnKey && !force) return Promise.resolve()
+  if (traeCnKeyScan) return traeCnKeyScan
+  if (!force && !traeCnKey && traeCnKeyProbe && Date.now() - traeCnKeyCheckedAt < TRAECN_KEY_RETRY_MS) {
+    return Promise.resolve()
+  }
+  traeCnKeyCheckedAt = Date.now()
+  traeCnKeyScan = readTraeCnKey(traeCnDbPath())
+    .then((probe) => {
+      traeCnKeyProbe = probe
+      traeCnKey = probe.key
+    })
+    .catch(() => {
+      traeCnKeyProbe = { pids: [], key: null }
+      traeCnKey = null
+    })
+    .finally(() => {
+      traeCnKeyScan = null
+    })
+  return traeCnKeyScan
+}
+
 /* ------------------------------------------------------------ 采集 */
 
 /** OpenCode Go 的额度客户端。懒创建：只有真的切到那个源才会实例化、才会去读 auth.json */
@@ -140,6 +201,8 @@ function sourceDir(kind: SourceKind): string {
   if (kind === 'qoder') return qoderDir()
   if (kind === 'reasonix') return reasonixDir()
   if (kind === 'dsh') return dshDir()
+  if (kind === 'traecn') return traeCnDir()
+  if (kind === 'opencode-desktop') return opencodeDir()
   if (kind === 'opencode') return opencodeDir()
   return workbuddyDir()
 }
@@ -278,9 +341,60 @@ function refresh(force = false): Snapshot | null {
     } else if (kind === 'qoder') {
       snapshot = collectQoderSnapshot({ qoderDir: sourceDir(kind), cache: qoderCache })
     } else if (kind === 'reasonix') {
-      snapshot = collectReasonixSnapshot({ reasonixDir: sourceDir(kind), cache: reasonixCache })
+      snapshot = collectReasonixSnapshot({
+        reasonixDir: sourceDir(kind),
+        statsDir: reasonixStatsDir(),
+        cache: reasonixCache
+      })
     } else if (kind === 'dsh') {
       snapshot = collectDshSnapshot({ dshDir: sourceDir(kind), cache: dshCache })
+    } else if (kind === 'traecn') {
+      const dbPath = traeCnDbPath()
+      // 缓存的密钥要先验一页 HMAC 再用：TraeWork 重启会换钥，直接拿旧钥去解密
+      // 只会得到一库乱码 —— 而乱码很像「库坏了」，特别容易查错方向。
+      if (traeCnKey && !probeTraeCnKey(dbPath, traeCnKey)) traeCnKey = null
+      // 有钥且 db+wal 都没动过，就别每 20 秒把「拷库 + 逐页 AES + 回放 WAL」整价
+      // 再付一遍：TraeWork 关着的时候库是死的，重解出来的全是同一份内容。
+      // 手动刷新（force）绕开缓存 —— 用户点「刷新」就该是真的重读一遍。
+      const stamp = traeCnKey ? traeCnFileStamp(dbPath) : null
+      if (stamp && !force && traeCnStampCache?.stamp === stamp) {
+        // warnings 必须浅拷贝：这份快照往下还可能被 push「取不到钥」的提示，
+        // 复用原数组会让提示在缓存里越积越多。
+        snapshot = { ...traeCnStampCache.snapshot, warnings: [...traeCnStampCache.snapshot.warnings] }
+      } else {
+        snapshot = collectTraeCnSnapshot({ dbPath, key: traeCnKey, statePath: traeCnStatePath() })
+        if (stamp) traeCnStampCache = { stamp, snapshot }
+      }
+      if (!traeCnKey && traeCnKeyProbe) {
+        // 说真话：扫描还没跑完时不能说「App 没在跑」—— 那时候根本还不知道
+        // TraeWork 开没开。这两种情况对用户的动作完全不同（等 vs 去启动它），
+        // 混成一条提示只会让人以为真出问题了。
+        snapshot.warnings.push(
+          traeCnKeyProbe.pids.length
+            ? `TRAE SOLO CN 正在运行（pid ${traeCnKeyProbe.pids.join(',')}），但没在那个进程的内存里认出数据库密钥`
+            : 'TRAE SOLO CN 当前没有运行，读不到用量 —— 这个数据源的密钥只存在于它的进程内存里'
+        )
+      }
+      // 取密钥要扫 ~680MB 内存（21 秒量级），绝不能挡住这次刷新：
+      // 先把「读不到」画出来，取到了再走一遍广播（与额度源同一套路数）。
+      // 只认「进这分支时还没钥、ensure 扫完拿到了」的边沿：ensureTraeCnKey 在
+      // 钥已缓存时是立即 resolve 的，无条件 refresh 会自己触发自己 —— 每一圈
+      // 都是一次全量解密（拷库 + 逐页 AES + 回放 WAL），主进程从此忙死（卡死根因）。
+      const hadTraeCnKey = traeCnKey !== null
+      // 扫密钥这段空窗必须如实标出来：上面那张「全 0」快照不是读完了读出 0，
+      // 而是一行都没读到。界面靠这个字段画骨架而不是画 0（见 types 的 PendingReason）。
+      if (!traeCnKey && !traeCnKeyProbe) {
+        snapshot.pending = 'key-scan'
+        // 采集器自己那条「没取到密钥（没在运行？）」在扫描期间是**假的** ——
+        // 那时候还没开始扫，根本不知道 TraeWork 开没开。留着它等于同时说
+        // 「正在读」和「读不到」，界面会自己打架。骨架里本来就会说明在等什么。
+        snapshot.warnings = snapshot.warnings.filter((warning) => !warning.includes('密钥'))
+      }
+      void ensureTraeCnKey().then(() => {
+        if (!hadTraeCnKey && traeCnKey && currentSource() === 'traecn') refresh()
+      })
+    } else if (kind === 'opencode-desktop') {
+      snapshot = collectOpencodeSnapshot({ opencodeDir: sourceDir(kind), cacheDir: opencodeCacheDir() })
     } else if (kind === 'opencode') {
       snapshot = buildOpencodeSnapshot()
       // 网络请求绝不能挡住 20 秒一次的同步轮询：先把缓存画出来，真拉到了再走一遍广播。
@@ -393,6 +507,7 @@ function currentFloatState(): FloatState {
       visible: false,
       loaded: false,
       expanded: false,
+      capsule: null,
       side: 'up',
       alignRight: true,
       bounds: null
@@ -548,6 +663,71 @@ function bootstrap(): void {
   timer.unref?.()
 
   if (SMOKE) {
+    /*
+     * 首屏那一拍单独量：traecn 启动时要扫密钥，那十几秒里界面**不能**画成一个
+     * 假装读完了的 0。这是这套交互的验收点，所以放在自检计时器起跑之前 ——
+     * 后面那些度量跑的时候真值早就到了，量到的只会是稳定态。
+     *
+     * 前提是当前源就是 traecn，否则量到的会是别的源（毫秒级，本来就不该有骨架）。
+     * 自检默认源是 workbuddy，所以先切过去，等它进 pending 再量 —— 用切源
+     * 触发而不是改用户设置，免得把人家配置改了不换回来。
+     */
+    setTimeout(() => {
+      const win = mainWindow
+      if (!win || win.isDestroyed()) return
+      const measure = (): void => {
+        void win.webContents
+          .executeJavaScript(
+            `(() => ({
+               source: document.querySelector('.source-switch .active')?.textContent || '',
+               blocks: document.querySelectorAll('.pending').length,
+               title: document.querySelector('.pending-title')?.textContent || '',
+               headline: [...document.querySelectorAll('.headline-value')].map((el) => el.textContent)
+             }))()`
+          )
+          .then((paint) => {
+            const first = paint as Record<string, unknown>
+            smoke('first-paint', {
+              ...first,
+              // 核心一条：挂着骨架时绝不能同时画着数字 —— 那是「读完了读出 0」
+              ok: (first['blocks'] as number) === 0 || ((first['headline'] as string[]) ?? []).length === 0
+            })
+            return win.webContents.capturePage()
+          })
+          .then((image) => {
+            const dir = join(tmpdir(), 'wbtm-smoke')
+            mkdirSync(dir, { recursive: true })
+            writeFileSync(join(dir, 'window-first-paint.png'), image.toPNG())
+          })
+          .catch(() => undefined)
+      }
+      if (settingsStore?.settings.source === 'traecn') {
+        measure()
+      } else {
+        void win.webContents
+          .executeJavaScript(
+            `(() => {
+               const root = document.querySelector('.source-switch')
+               const label = ${JSON.stringify(sourceLabel('traecn'))}
+               const direct = [...root.querySelectorAll('button')].find((el) => el.textContent.trim() === label)
+               if (direct) direct.click()
+               else root.querySelector('.source-more')?.click()
+             })()`
+          )
+          .then(() => new Promise((resolve) => setTimeout(resolve, 400)))
+          .then(() => win.webContents.executeJavaScript(
+            `(() => {
+               const label = ${JSON.stringify(sourceLabel('traecn'))}
+               const item = [...document.querySelectorAll('.source-menu button')].find((el) => el.textContent.trim() === label)
+               if (item) item.click()
+             })()`
+          ))
+          .then(() => new Promise((resolve) => setTimeout(resolve, SMOKE_FIRST_PAINT_MS)))
+          .then(measure)
+          .catch(() => undefined)
+      }
+    }, 1200)
+
     // 看门狗：自检挂死时留下证据并主动退出，而不是让调用方干等
     const watchdog = setTimeout(() => {
       smoke('timeout', { limit: SMOKE_TIMEOUT_MS, at: Date.now() })
@@ -601,6 +781,9 @@ function bootstrap(): void {
           // 只在自检里跑，跑完立刻切回去，免得把用户自己的设置改掉。
           const sourceBefore = settingsStore?.settings.source ?? 'workbuddy'
           const switches: Array<{ expected: SourceKind; actual: SourceKind | undefined; dom: unknown }> = []
+          /** 切源 1.5 秒后还挂着载入态的源 —— traecn 属预期（扫密钥要二十几秒），其余才是漏 */
+          const stablePendingLeaks: SourceKind[] = []
+          const pendingHeld: Array<{ source: SourceKind; title: string }> = []
           for (const target of SOURCE_ORDER) {
             if (target === sourceBefore) continue
             // 前三个源就是按钮本身，其余收在「更多」下拉里 —— 两条路径都要真的点一遍
@@ -636,6 +819,21 @@ function bootstrap(): void {
                  }
                })()`
             )
+            // 载入态要在切源后立刻量：切到 traecn 时它要去扫密钥，那十几秒里
+            // 界面上不能是一个假装读完了的 0（真值到了之后 .pending 必然为 0，
+            // 所以这里量的就是「稳定态不该有骨架」这一半）。
+            const pendingAfter = await win.webContents.executeJavaScript(
+              `(() => ({
+                 blocks: document.querySelectorAll('.pending').length,
+                 title: document.querySelector('.pending-title')?.textContent || ''
+               }))()`
+            )
+            const pendingTitle = pendingAfter.title
+            // 骨架那一拍单独留张图：它是这套交互唯一「平时看不到」的形态
+            if (pendingAfter.blocks > 0) {
+              const shot = await win.webContents.capturePage()
+              writeFileSync(join(dir, `window-pending-${target}.png`), shot.toPNG())
+            }
             // 截图前先滚回顶部：自检要能一眼看到「今日」与上下文水位这两张卡
             await win.webContents.executeJavaScript(
               `(() => { const el = document.querySelector('.app-body'); if (el) el.scrollTop = 0 })()`
@@ -643,8 +841,28 @@ function bootstrap(): void {
             await new Promise((resolve) => setTimeout(resolve, 300))
             writeFileSync(join(dir, `window-${target}.png`), (await win.webContents.capturePage()).toPNG())
             switches.push({ expected: target, actual: settingsStore?.settings.source, dom: switched })
+            // 切完一轮之后还挂着骨架 —— 分两种情况，判定相反：
+            // - traecn：1.5 秒远不够（扫密钥 ~21 秒），这时挂着骨架**是对的**
+            // - 其余源：都是毫秒级，真值早该到了，这时还挂着就是漏了
+            if (pendingAfter > 0) {
+              pendingHeld.push({ source: target, title: pendingTitle || '(无标题)' })
+              if (target !== 'traecn') stablePendingLeaks.push(target)
+            }
           }
           smoke('source-switch', { from: sourceBefore, switches })
+          smoke('pending', {
+            // 切源后仍挂着骨架的源；traecn 属预期，其余为空才对
+            held: pendingHeld,
+            leaks: stablePendingLeaks,
+            // 关键一条：骨架在的时候绝不能同时画着数字（那是「读完了读出 0」）
+            noFakeZero: pendingHeld.every((entry) => {
+              const dom = switches.find((s) => s.expected === entry.source)?.dom as
+                | { headline?: string[] }
+                | undefined
+              return (dom?.headline ?? []).length === 0
+            }),
+            ok: stablePendingLeaks.length === 0
+          })
           patchSettings({ source: sourceBefore })
           await new Promise((resolve) => setTimeout(resolve, 1500))
 
@@ -935,6 +1153,7 @@ function bootstrap(): void {
            })()`
 
           const collapsedBounds = floatWin.getBounds()
+          const collapsedCapsule = currentFloatState().capsule
           await floatWin.webContents.executeJavaScript(clickCapsule)
           await new Promise((resolve) => setTimeout(resolve, 700))
 
@@ -968,6 +1187,17 @@ function bootstrap(): void {
                      ])
                    : null,
                  actions: [...document.querySelectorAll('.card-foot button')].map((el) => el.textContent),
+                 pin: (() => {
+                   const el = document.querySelector('.card-icon.pin')
+                   return el
+                     ? {
+                         present: true,
+                         on: el.dataset.on,
+                         pressed: el.getAttribute('aria-pressed'),
+                         title: el.getAttribute('title')
+                       }
+                     : { present: false }
+                 })(),
                  capsuleSize: el ? [el.clientWidth, el.clientHeight] : null,
                  viewport: [window.innerWidth, window.innerHeight]
                }
@@ -986,9 +1216,57 @@ function bootstrap(): void {
           await new Promise((resolve) => setTimeout(resolve, 500))
           smoke('float-collapse', {
             expanded: currentFloatState().expanded,
-            before: floatWin.getBounds(),
-            capsuleAt: [collapsedBounds.x, collapsedBounds.y]
+            bounds: floatWin.getBounds(),
+            capsuleBefore: collapsedCapsule,
+            capsuleAfter: currentFloatState().capsule
           })
+
+          /*
+           * 卡片上的置顶开关：要验的是**窗口真的换了层级**，而不是按钮的 class 变了。
+           *
+           * 只看 DOM 的话，「点了有反应」和「窗口置顶了」是两回事 —— 前者任何
+           * 一点样式变化都能满足。所以这里读 BrowserWindow.isAlwaysOnTop()：
+           * 那是 DWM 视角的事实。顺手也确认设置落盘了（重启后要还是这个值）。
+           *
+           * 测完必须复原：把置顶关掉，否则后面那些截图步骤会在最前一层跑，
+           * 报告里的层级前提就不对了。
+           */
+          const alwaysOnTopStep = async (): Promise<{
+            before: boolean
+            after: boolean
+            stored: boolean
+            pressed: string | null
+          }> => {
+            const before = floatWin.isAlwaysOnTop()
+            await floatWin.webContents.executeJavaScript(
+              `(() => { const el = document.querySelector('.card-icon.pin'); if (el) el.click(); return !!el })()`
+            )
+            await new Promise((resolve) => setTimeout(resolve, 400))
+            const after = floatWin.isAlwaysOnTop()
+            const pressed = await floatWin.webContents.executeJavaScript(
+              `document.querySelector('.card-icon.pin')?.getAttribute('aria-pressed') ?? null`
+            )
+            return { before, after, stored: settingsStore?.settings.floatAlwaysOnTop ?? before, pressed }
+          }
+
+          // 先展开卡片（置顶按钮在卡片头上）
+          await floatWin.webContents.executeJavaScript(clickCapsule)
+          await new Promise((resolve) => setTimeout(resolve, 700))
+          const onTopOff = await alwaysOnTopStep()
+          // 再点回来，确认它是个开关而不是单向置位
+          const onTopOn = await alwaysOnTopStep()
+          await smoke('float-always-on-top', {
+            off: onTopOff,
+            back: onTopOn,
+            restored: floatWin.isAlwaysOnTop(),
+            stored: settingsStore?.settings.floatAlwaysOnTop ?? null
+          })
+          // 复原成默认的置顶（true），让后续步骤的层级前提与基线一致
+          if (!floatWin.isAlwaysOnTop()) {
+            await alwaysOnTopStep()
+            await new Promise((resolve) => setTimeout(resolve, 300))
+          }
+
 
           /*
            * 每个胶囊主题各截两张：收起态的胶囊、展开态的卡片。
@@ -1157,6 +1435,8 @@ ipcMain.on('float:move', (_event, dx: unknown, dy: unknown) => {
 // 单击胶囊 = 展开 / 收起悬浮卡片（不再直接开面板，那一步挪到卡片里）
 ipcMain.on('float:toggle-card', () => floatWindow?.toggleExpand())
 ipcMain.on('float:collapse-card', () => floatWindow?.setExpanded(false))
+// 收起握手：渲染层把卡片拆掉并呈现了一帧，这时缩窗正好无感（见 FloatWindow.setExpanded）
+ipcMain.on('float:content-settled', () => floatWindow?.contentSettled())
 ipcMain.handle('float:state', () => currentFloatState())
 ipcMain.on('float:open-panel', () => {
   // 进面板前先把卡片收掉：留着它只会和主窗口抢眼球

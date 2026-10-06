@@ -39,7 +39,7 @@ export function credits(value: number): string {
 /**
  * 该数据源是否按积分计量。
  * WorkBuddy 与 Qoder CN 有积分这一层 —— Qoder CN 甚至**只有**积分
- * （服务端不回 token），其余六个源没有，所有积分相关的数字、比价、
+ * （服务端不回 token），其余七个源没有，所有积分相关的数字、比价、
  * 提示都要整块收起来，显示成 0 分比不显示更糟。
  */
 export function hasCredits(kind: SourceKind): boolean {
@@ -59,12 +59,23 @@ export function hasTokens(kind: SourceKind): boolean {
 
 /**
  * 该数据源是否单列思考 token。
- * WorkBuddy、ZCode 与 MiMo 单列；Kimi Code 的 output 里已含思考，
- * Reasonix 与 DeepSeek Harness 也一样（前者引擎不单记，后者 pi-ai 把 reasoning
- * 折进了 output），都没有这一项，留着只会永远是一根 0 长度的空条。
+ * WorkBuddy、ZCode、MiMo 与 OpenCode 单列；Kimi Code 的 output 里已含思考，
+ * DeepSeek Harness 也一样（pi-ai 把 reasoning 折进了 output）。
+ * Reasonix 老流水把思考折进 completion、不单记，但 2026-06 起新版按天流水
+ * 单记了 reasoning（仍是输出的子集）—— 有真数据就不该藏，照常显示。
+ * TRAE SOLO CN 同理：exact_reasoning_tokens_v1 单记，但语义标记写明
+ * `provider_raw_usage_completion_includes_reasoning`，它已经在 output 里了，
+ * 所以只作明细、不加进合计。
  */
 export function hasReasoning(kind: SourceKind): boolean {
-  return kind === 'workbuddy' || kind === 'zcode' || kind === 'mimo'
+  return (
+    kind === 'workbuddy' ||
+    kind === 'zcode' ||
+    kind === 'mimo' ||
+    kind === 'reasonix' ||
+    kind === 'traecn' ||
+    kind === 'opencode-desktop'
+  )
 }
 
 /**
@@ -81,6 +92,7 @@ export function hasQuota(kind: SourceKind): boolean {
  * 前四位直接显示为按钮，其余收进「更多」。WorkBuddy 与 DeepSeek Harness 固定在
  * 前两位（2026-10-01 用户指定，DSH 是本机的主力源）；其余按「账本性质」排：
  * 带积分的（Qoder CN 只有积分）在前，只有 token 的随后，最后是唯一联网查额度的那个。
+ * OpenCode 的两个入口挨着排：本地用量在前，联网额度在后。
  */
 export const SOURCE_ORDER: SourceKind[] = [
   'workbuddy',
@@ -90,6 +102,8 @@ export const SOURCE_ORDER: SourceKind[] = [
   'zcode',
   'mimo',
   'reasonix',
+  'traecn',
+  'opencode-desktop',
   'opencode'
 ]
 
@@ -101,6 +115,8 @@ export function sourceLabel(kind: SourceKind): string {
   if (kind === 'mimo') return 'MiMo'
   if (kind === 'reasonix') return 'Reasonix'
   if (kind === 'dsh') return 'DeepSeek Harness'
+  if (kind === 'traecn') return 'TRAE SOLO CN'
+  if (kind === 'opencode-desktop') return 'OpenCode'
   if (kind === 'opencode') return 'OpenCode Go'
   return 'Kimi Code'
 }

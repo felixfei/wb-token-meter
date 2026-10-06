@@ -1,4 +1,4 @@
-import { StrictMode, useCallback, useEffect, useMemo, useRef, useState, type JSX } from 'react'
+import { StrictMode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type JSX } from 'react'
 import { createRoot } from 'react-dom/client'
 import { CAPSULE_THEME_ORDER, capsuleThemeLabel, capsuleThemeShort, resolveCapsuleTheme } from '@shared/capsule'
 import {
@@ -215,7 +215,9 @@ function Card({
   side,
   alignRight,
   theme,
+  alwaysOnTop,
   onCycleTheme,
+  onToggleAlwaysOnTop,
   onCollapse
 }: {
   snapshot: Snapshot | null
@@ -223,7 +225,9 @@ function Card({
   side: FloatCardSide
   alignRight: boolean
   theme: CapsuleTheme
+  alwaysOnTop: boolean
   onCycleTheme: () => void
+  onToggleAlwaysOnTop: () => void
   onCollapse: () => void
 }): JSX.Element {
   const [busy, setBusy] = useState(false)
@@ -254,6 +258,29 @@ function Card({
       <header className="card-head">
         <i className="live" aria-hidden="true" />
         <span className="card-src">{sourceLabel(kind)}</span>
+        <button
+          type="button"
+          className="card-icon pin"
+          data-on={alwaysOnTop ? 'true' : 'false'}
+          aria-pressed={alwaysOnTop}
+          title={`胶囊置顶：${alwaysOnTop ? '开' : '关'}（点击切换）`}
+          aria-label={`胶囊置顶，当前${alwaysOnTop ? '开' : '关'}，点击切换`}
+          onClick={onToggleAlwaysOnTop}
+        >
+          {/*
+           * 图钉朝上、钉身压在一条横线上 —— 记的是「压在最上面」这层意思。
+           * 两态不靠换图标（换图标在小尺寸上根本看不出差别），靠颜色深浅。
+           */}
+          <svg viewBox="0 0 12 12" aria-hidden="true">
+            <path
+              d="M6 9.4V3.2M4.1 5.1 6 3.2l1.9 1.9M2.4 10.6h7.2"
+              stroke="currentColor"
+              strokeWidth="1.3"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </svg>
+        </button>
         <button
           type="button"
           className="card-icon theme"
@@ -566,7 +593,13 @@ function FloatApp(): JSX.Element {
   const [side, setSide] = useState<FloatCardSide>('up')
   const [alignRight, setAlignRight] = useState(true)
   const [dragging, setDragging] = useState(false)
-  const theme = settings?.floatTheme ?? 'auto'
+  /*
+   * 回退链要先吃 preload 从启动参数读到的档位，再兜到 auto。
+   * settings 是异步 IPC 取回来的，到货前若先按 `auto` 解析，这个 effect 会把
+   * preload 已经写好的首帧档位覆盖掉 —— 用户选了琥珀/碳黑的话，窗口创建时
+   * 会先闪一下错色，正是启动参数那套机制要消灭的那一帧。
+   */
+  const theme = settings?.floatTheme ?? meter?.initialCapsuleTheme ?? 'auto'
   useCapsuleTheme(theme)
   const readings = useMemo(() => readingsOf(snapshot), [snapshot])
 
@@ -611,6 +644,22 @@ function FloatApp(): JSX.Element {
     return () => window.removeEventListener('keydown', onKey)
   }, [expanded])
 
+  /*
+   * 展开状态的内容一切换完就回报主进程：收起时它等这声「画完了」才缩窗口。
+   * 双 rAF —— 第一个回调还在新内容的呈现之前跑，第二个必然在其后，
+   * 提前回报的话主进程会把还挂着卡片的窗口缩掉，那一刀就白躲了。
+   */
+  useLayoutEffect(() => {
+    let raf2 = 0
+    const raf1 = requestAnimationFrame(() => {
+      raf2 = requestAnimationFrame(() => meter?.floatContentSettled())
+    })
+    return () => {
+      cancelAnimationFrame(raf1)
+      cancelAnimationFrame(raf2)
+    }
+  }, [expanded, side, alignRight])
+
   const cycleTheme = useCallback(() => {
     if (!meter) return
     const next = CAPSULE_THEME_ORDER[(CAPSULE_THEME_ORDER.indexOf(theme) + 1) % CAPSULE_THEME_ORDER.length]
@@ -618,6 +667,14 @@ function FloatApp(): JSX.Element {
     setSettings((current) => (current ? { ...current, floatTheme: next } : current))
     void meter.updateSettings({ floatTheme: next }).then(setSettings).catch(() => undefined)
   }, [theme])
+
+  const toggleAlwaysOnTop = useCallback(() => {
+    if (!meter) return
+    const next = !(settings?.floatAlwaysOnTop ?? true)
+    // 同 cycleTheme：先翻，广播回来再对齐
+    setSettings((current) => (current ? { ...current, floatAlwaysOnTop: next } : current))
+    void meter.updateSettings({ floatAlwaysOnTop: next }).then(setSettings).catch(() => undefined)
+  }, [settings?.floatAlwaysOnTop])
 
   const solid = settings?.floatSolidBackground ?? false
   const capsuleSize = CAPSULE_SIZES[settings?.floatSize ?? 'medium']
@@ -639,7 +696,9 @@ function FloatApp(): JSX.Element {
           side={side}
           alignRight={alignRight}
           theme={theme}
+          alwaysOnTop={settings?.floatAlwaysOnTop ?? true}
           onCycleTheme={cycleTheme}
+          onToggleAlwaysOnTop={toggleAlwaysOnTop}
           onCollapse={() => meter?.collapseFloatCard()}
         />
       ) : null}

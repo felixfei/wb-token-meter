@@ -120,6 +120,11 @@ export interface FloatPlacement {
    * 调用方拿它当唯一真相存起来，展开再收起之后胶囊才不会一格一格地漂。
    */
   capsule: Point
+  /**
+   * 形状模式（透明窗口）下要套在窗口上的 region；null = 恢复矩形。
+   * 见 floatWindowBounds 的 shapeMode 说明。
+   */
+  shape: Box[] | null
 }
 
 /**
@@ -137,11 +142,70 @@ export function floatWindowBounds(opts: {
   capsule: Point
   expanded: boolean
   workArea: Box
+  /**
+   * 形状模式（透明窗口）：窗口**恒为展开尺寸、永不 resize**，收起态用 region
+   * 把窗口裁到胶囊那一块。透明窗口 resize 会撞上 DWM 的两个毛病：
+   * 新内容滞后一两百毫秒才上屏，切换的瞬间还夹一帧全空 —— 表现就是收起卡片时
+   * 胶囊闪一下。region（SetWindowRgn）的裁剪是即时的，纹理不变就没有重锚问题。
+   * 非透明窗口（solid 降级模式）不传它，走原来的 resize 路径。
+   */
+  shapeMode?: boolean
+  /**
+   * 收起态沿用的方向（side + 胶囊贴哪一边）。形状模式必传，且必须是**渲染层
+   * 当前正在摆的那一组** —— 它的 data-side / align-items 要等 float:expanded
+   * 到货才改；主进程这边先翻边，region 就罩到卡片那一块上去了。
+   * 不传则按胶囊当前位置现算（首次落位、或 solid 降级模式）。
+   */
+  frozen?: { side: FloatCardSide; alignRight: boolean } | null
 }): FloatPlacement {
-  const { size, capsule, expanded, workArea } = opts
-  const win = expanded ? expandedWindowSizeOf(size) : windowSizeOf(size)
-  const side = expanded ? floatCardSide(size, capsule, workArea) : 'up'
+  const { size, capsule, expanded, workArea, shapeMode, frozen } = opts
+  const win = shapeMode ? expandedWindowSizeOf(size) : expanded ? expandedWindowSizeOf(size) : windowSizeOf(size)
   const half = workArea.x + workArea.width / 2
+
+  /*
+   * 形状模式。两条铁律，缺一条收起就会闪：
+   *
+   * 1) **两态的 bounds 逐像素相同**。位置一律按「展开态那一套 offset」算，
+   *    收起只是多套一个 region。窗口在切换时一个像素都不动，DWM 也就没有
+   *    重锚的余地 —— 只要动过（哪怕只动 1px），透明窗口就会闪。
+   * 2) **方向沿用展开前那一组**（frozen 传进来）。渲染层的 data-side 与
+   *    align-items 是收到 float:expanded 之后才改的；主进程这边先翻边，
+   *    region 就会罩在卡片那一块上，屏幕上闪出来的正是那块方形的卡片。
+   *    卡片在下（side=down）时偏移是整整一张卡片的高度，所以那边必现；
+   *    跨屏幕中线拖拽时 alignRight 翻边，同样现。
+   */
+  if (shapeMode) {
+    const cap = CAPSULE_SIZES[size]
+    const side = expanded || !frozen ? floatCardSide(size, capsule, workArea) : frozen.side
+    const alignRight =
+      expanded || !frozen ? capsule.x + cap.width / 2 >= half : frozen.alignRight
+    const offset = capsuleOffset({ size, expanded: true, side, alignRight })
+    // 钳的只是胶囊本身：窗口与 region 允许压出屏幕，那一段不渲染也不吃点击
+    const x = Math.round(
+      Math.min(Math.max(capsule.x, workArea.x), workArea.x + workArea.width - cap.width)
+    )
+    const y = Math.round(
+      Math.min(Math.max(capsule.y, workArea.y), workArea.y + workArea.height - cap.height)
+    )
+    return {
+      bounds: { x: x - offset.x, y: y - offset.y, width: win.width, height: win.height },
+      side,
+      alignRight,
+      capsule: { x, y },
+      shape: expanded
+        ? null
+        : [
+            {
+              x: offset.x - SHADOW_PAD,
+              y: offset.y - SHADOW_PAD,
+              width: cap.width + SHADOW_PAD * 2,
+              height: cap.height + SHADOW_PAD * 2
+            }
+          ]
+    }
+  }
+
+  const side = expanded ? floatCardSide(size, capsule, workArea) : 'up'
   const alignRight = capsule.x + CAPSULE_SIZES[size].width / 2 >= half
   const offset = capsuleOffset({ size, expanded, side, alignRight })
 
@@ -156,7 +220,8 @@ export function floatWindowBounds(opts: {
     bounds: { x, y, width: win.width, height: win.height },
     side,
     alignRight,
-    capsule: { x: x + offset.x, y: y + offset.y }
+    capsule: { x: x + offset.x, y: y + offset.y },
+    shape: null
   }
 }
 
