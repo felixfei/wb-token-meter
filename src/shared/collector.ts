@@ -1,9 +1,12 @@
 import { DatabaseSync } from 'node:sqlite'
 import {
+  closeSync,
   copyFileSync,
   existsSync,
   mkdtempSync,
+  openSync,
   readFileSync,
+  readSync,
   readdirSync,
   rmSync,
   statSync
@@ -151,7 +154,98 @@ export interface FileParseResult {
   title: string
 }
 
-export type ParseCache = Map<string, { mtimeMs: number; size: number; result: FileParseResult }>
+/**
+ * 解析缓存。parsedBytes 记录「已经解析到文件的第几个字节」——
+ * transcript 是只追加的 JSONL，文件变大时从上次的位置增量解析即可，
+ * 不必每个轮询周期把几百 MB 重读一遍。文件变小视为被重写，全量重来。
+ */
+export type ParseCache = Map<
+  string,
+  { mtimeMs: number; size: number; result: FileParseResult; parsedBytes?: number }
+>
+
+/**
+ * 超过这个字节数就改走分块流式解析。
+ * V8 字符串上限是 0x1fffffe8（约 5.37 亿）字符，readFileSync 一次性读入
+ * 超限文件会抛 ERR_STRING_TOO_LONG —— 实测 2026-10-06，一个长期会话的
+ * transcript 长到 525 MB 后整个会话的记录从看板上静默消失，只留一个空结果。
+ * JSONL 几乎全是 ASCII，字符数接近字节数，500 MB 是个保守的阈值。
+ */
+export let streamThresholdBytes = 500 * 1024 * 1024
+
+/** 测试钩子：把流式阈值临时调低，用小文件覆盖大文件路径 */
+export function setStreamThresholdForTest(bytes: number): void {
+  streamThresholdBytes = bytes
+}
+
+interface ParseState {
+  calls: CallRecord[]
+  title: string
+}
+
+function handleLine(
+  line: string,
+  sessionId: string,
+  projectDir: string,
+  state: ParseState
+): void {
+  if (!state.title && line.indexOf('"ai-title"') >= 0) {
+    try {
+      const parsed = JSON.parse(line) as Record<string, unknown>
+      if (typeof parsed.aiTitle === 'string') state.title = parsed.aiTitle
+    } catch {
+      /* 忽略坏行 */
+    }
+  }
+  if (line.indexOf('"usage"') < 0) return
+  const record = parseUsageLine(line, sessionId, projectDir)
+  if (record) state.calls.push(record)
+}
+
+/**
+ * 从 startOffset 起按块读取、按 \n 切行解析（字节级切分是安全的：
+ * 0x0A 不会出现在任何 UTF-8 多字节序列内部）。
+ * 返回「最后一个完整行行尾之后」的字节偏移 —— 尾巴上没写完的半行留到下轮，
+ * 与 WorkBuddy 的追加节奏天然对齐。
+ */
+function streamParseLines(
+  file: string,
+  startOffset: number,
+  sessionId: string,
+  projectDir: string,
+  state: ParseState
+): number {
+  const CHUNK = 8 * 1024 * 1024
+  const fd = openSync(file, 'r')
+  try {
+    let offset = startOffset
+    let carry: Buffer = Buffer.alloc(0)
+    for (;;) {
+      const buf = Buffer.alloc(CHUNK)
+      const bytes = readSync(fd, buf, 0, CHUNK, offset)
+      if (bytes <= 0) break
+      const chunk = carry.length ? Buffer.concat([carry, buf.subarray(0, bytes)]) : buf.subarray(0, bytes)
+      let lineStart = 0
+      for (;;) {
+        const nl = chunk.indexOf(10, lineStart)
+        if (nl < 0) break
+        const line = chunk.subarray(lineStart, nl).toString('utf8')
+        handleLine(line.endsWith('\r') ? line.slice(0, -1) : line, sessionId, projectDir, state)
+        lineStart = nl + 1
+      }
+      carry = chunk.subarray(lineStart)
+      offset += bytes
+      if (bytes < CHUNK) break
+    }
+    return offset - carry.length
+  } finally {
+    try {
+      closeSync(fd)
+    } catch {
+      /* ignore */
+    }
+  }
+}
 
 export function parseTranscriptFile(
   file: string,
@@ -169,33 +263,56 @@ export function parseTranscriptFile(
   const cached = cache?.get(file)
   if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.result
 
-  let text: string
-  try {
-    text = readFileSync(file, 'utf8')
-  } catch {
-    return { calls: [], title: '' }
-  }
-
-  const calls: CallRecord[] = []
-  let title = ''
-  for (const line of text.split('\n')) {
-    if (!line) continue
-    if (!title && line.indexOf('"ai-title"') >= 0) {
-      try {
-        const parsed = JSON.parse(line) as Record<string, unknown>
-        if (typeof parsed.aiTitle === 'string') title = parsed.aiTitle
-      } catch {
-        /* 忽略坏行 */
-      }
+  // 小文件走一次性读入的老路径（几 MB 内最快，行为与历史版本完全一致）
+  if (stat.size <= streamThresholdBytes) {
+    let text: string
+    try {
+      text = readFileSync(file, 'utf8')
+    } catch {
+      // stat 与 read 之间恰好越过了字符串上限等极端情形：落入流式路径
+      return parseOversize(file, sessionId, projectDir, cache, stat, cached)
     }
-    if (line.indexOf('"usage"') < 0) continue
-    const record = parseUsageLine(line, sessionId, projectDir)
-    if (record) calls.push(record)
+    const state: ParseState = { calls: [], title: '' }
+    for (const line of text.split('\n')) {
+      if (!line) continue
+      handleLine(line, sessionId, projectDir, state)
+    }
+    const result: FileParseResult = { calls: state.calls, title: state.title }
+    cache?.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, result, parsedBytes: stat.size })
+    return result
   }
 
-  const result: FileParseResult = { calls, title }
-  cache?.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, result })
-  return result
+  return parseOversize(file, sessionId, projectDir, cache, stat, cached)
+}
+
+/** 超大 transcript：增量（或首次全量）流式解析 */
+function parseOversize(
+  file: string,
+  sessionId: string,
+  projectDir: string,
+  cache: ParseCache | undefined,
+  stat: { mtimeMs: number; size: number },
+  cached?: { mtimeMs: number; size: number; result: FileParseResult; parsedBytes?: number }
+): FileParseResult {
+  // 只追加是 transcript 的常态：文件变大且上次解析过，就从上次的位置接着读；
+  // 文件变小（被重写/清理）或没有可接续的缓存，才全量重读
+  const prevResult = cached?.result
+  const resumeFrom = prevResult && typeof cached?.parsedBytes === 'number' ? cached.parsedBytes : -1
+  const canIncrement = !!(prevResult && resumeFrom >= 0 && stat.size > resumeFrom)
+  const state: ParseState = canIncrement && prevResult
+    ? { calls: prevResult.calls.slice(), title: prevResult.title }
+    : { calls: [], title: '' }
+  const start = canIncrement ? resumeFrom : 0
+
+  try {
+    const parsedBytes = streamParseLines(file, start, sessionId, projectDir, state)
+    const result: FileParseResult = { calls: state.calls, title: state.title }
+    cache?.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, result, parsedBytes })
+    return result
+  } catch {
+    // 磁盘/锁之类的读故障：留旧结果总比清零好
+    return cached?.result ?? { calls: [], title: '' }
+  }
 }
 
 /* --------------------------------------------------------- 目录扫描 */

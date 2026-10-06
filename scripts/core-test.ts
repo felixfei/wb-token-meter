@@ -9,7 +9,7 @@
  *   4. OpenCode Go 的额度接口：除「真实数据」一段外全部打在本地 mock 服务上
  */
 import { createCipheriv, createHmac, pbkdf2Sync } from 'node:crypto'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { homedir, tmpdir } from 'node:os'
@@ -19,7 +19,15 @@ import { zstdCompressSync } from 'node:zlib'
 import { OpencodeUsage } from '../src/main/opencode-usage'
 import type { OpencodeUsageOptions } from '../src/main/opencode-usage'
 import { ModelsDevCatalog } from '../src/main/modelsdev'
-import { collectSnapshot, localDate, parseUsageLine } from '../src/shared/collector'
+import {
+  collectSnapshot,
+  localDate,
+  parseTranscriptFile,
+  parseUsageLine,
+  setStreamThresholdForTest,
+  streamThresholdBytes,
+  type ParseCache
+} from '../src/shared/collector'
 import {
   collectDshSnapshot,
   decodeZstdFrames,
@@ -884,6 +892,71 @@ check(
   '托盘菜单能切胶囊主题',
   readFileSync(join(process.cwd(), 'src', 'main', 'tray.ts'), 'utf8').includes('onSetFloatTheme')
 )
+
+/* ---------------------------------------------- 4b. 超大 transcript：流式解析与增量缓存 */
+
+section('超大 transcript：分块流式解析与增量缓存')
+
+/*
+ * 回归用例。2026-10-06 实测：一个长期会话的 transcript 长到 525 MB，
+ * readFileSync 超过 V8 字符串上限抛 ERR_STRING_TOO_LONG，parseTranscriptFile
+ * 把它当空文件吞掉 —— 整个会话的 token 与计费回合从看板上静默消失。
+ * 修复 = 超过阈值改走分块流式解析 + 按 parsedBytes 增量续读。
+ * 测试把阈值调到 1 KB，用小文件覆盖同一条代码路径。
+ */
+{
+  const streamRoot = mkdtempSync(join(tmpdir(), 'wbtm-stream-'))
+  const streamFile = join(streamRoot, 'big.jsonl')
+  const oldThreshold = streamThresholdBytes
+  try {
+    setStreamThresholdForTest(1024)
+    const cache: ParseCache = new Map()
+    const usageLine = (rid: string, input: number): string =>
+      JSON.stringify({
+        timestamp: 1_791_000_000_000,
+        providerData: { conversationRequestId: rid, traceId: '', usage: { inputTokens: input, outputTokens: 7 } }
+      })
+
+    writeFileSync(
+      streamFile,
+      ['{"type":"ai-title","aiTitle":"流式夹具"}', usageLine('rid_1', 100), usageLine('rid_2', 200)].join('\n') + '\n',
+      'utf8'
+    )
+    const first = parseTranscriptFile(streamFile, 'sess_stream', 'proj', cache)
+    check('流式路径：首次全量解析', first.calls.length === 2 && first.title === '流式夹具')
+    check('流式路径：记录解析到的字节偏移', cache.get(streamFile)?.parsedBytes === statSync(streamFile).size)
+
+    // 追加两行：必须增量续读，旧记录与新记录都在
+    appendFileSync(streamFile, [usageLine('rid_3', 300), usageLine('rid_4', 400)].join('\n') + '\n', 'utf8')
+    const second = parseTranscriptFile(streamFile, 'sess_stream', 'proj', cache)
+    check(
+      '增量续读：旧记录保留、新记录计入',
+      second.calls.length === 4 &&
+        second.calls[0].conversationRequestId === 'rid_1' &&
+        second.calls[3].conversationRequestId === 'rid_4',
+      `${second.calls.length} 条`
+    )
+    check('增量续读：标题不丢', second.title === '流式夹具')
+    check('增量续读：偏移推进到新文件尾', cache.get(streamFile)?.parsedBytes === statSync(streamFile).size)
+
+    // 内容没变：命中缓存，返回同一份结果
+    const third = parseTranscriptFile(streamFile, 'sess_stream', 'proj', cache)
+    check('未变化时命中缓存', third === second)
+
+    // 文件变小 = 被重写：全量重来，不能残留旧记录
+    writeFileSync(streamFile, [usageLine('rid_x', 900)].join('\n') + '\n', 'utf8')
+    const shrunk = parseTranscriptFile(streamFile, 'sess_stream', 'proj', cache)
+    check('文件变小视为重写', shrunk.calls.length === 1 && shrunk.calls[0].conversationRequestId === 'rid_x')
+
+    // 半行容错：尾部没写完的行不参与解析，也不计入偏移
+    appendFileSync(streamFile, usageLine('rid_tail', 500).slice(0, 40), 'utf8')
+    const partial = parseTranscriptFile(streamFile, 'sess_stream', 'proj', cache)
+    check('尾部半行不产生调用', partial.calls.length === 1)
+  } finally {
+    setStreamThresholdForTest(oldThreshold)
+    rmSync(streamRoot, { recursive: true, force: true })
+  }
+}
 
 /* ---------------------------------------------- 5. Kimi Code 数据源 */
 
