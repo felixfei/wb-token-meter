@@ -19,6 +19,7 @@ import { zstdCompressSync } from 'node:zlib'
 import { OpencodeUsage } from '../src/main/opencode-usage'
 import type { OpencodeUsageOptions } from '../src/main/opencode-usage'
 import { ModelsDevCatalog } from '../src/main/modelsdev'
+import { TraeCnUsage } from '../src/main/traecn-usage'
 import {
   collectSnapshot,
   localDate,
@@ -55,16 +56,25 @@ import {
   windowOf
 } from '../src/shared/opencode-quota'
 import {
+  DEFAULT_CREDITS_ENDPOINT,
+  describeCreditPacks,
+  describeCreditsHttpError,
+  parseCreditsResponse
+} from '../src/shared/traecn-credits'
+import {
   collectQoderSnapshot,
   parseQoderTitleLine,
   parseQoderUsageLine
 } from '../src/shared/qoder-collector'
 import {
   collectReasonixSnapshot,
+  parseReasonixMessageWorkspace,
   parseReasonixMeta,
   parseReasonixContextWindows,
+  parseReasonixSessionPreview,
   parseReasonixStatsLine,
-  parseReasonixUsageLine
+  parseReasonixUsageLine,
+  parseReasonixWireLine
 } from '../src/shared/reasonix-collector'
 import { collectZcodeSnapshot, parseConfigContextSizes, parseModelsDevContextSizes } from '../src/shared/zcode-collector'
 import { collectMimoSnapshot } from '../src/shared/mimo-collector'
@@ -396,6 +406,74 @@ check('计费回合命中数 = 全部 3 个', wbFixture.totals.matchedTraces ===
 check('口径对得上时不报假警告', !wbFixture.warnings.some((w) => w.includes('口径不一致')), wbFixture.warnings.join('; '))
 
 rmSync(wbRoot, { recursive: true, force: true })
+
+/*
+ * 回归用例（跨会话同计费键）。2026-10 审查发现：日/模型粒度的去重集合建在
+ * 「会话循环内」，只在一个会话里去重，而会话维的主循环是全局去重的 ——
+ * 同一个计费键落在两个会话里时，sessions 维只算一份、days/models 维算两份，
+ * 积分凭空变大，而 core-test 上方那三条恒等式断言在旧夹具下抓不到它。
+ *
+ * 夹具刻意让 req-dup-1 同时出现在 sess_dup_a 与 sess_dup_b，
+ * 且两个会话的 credit_json 都认这个键 —— 只有这样 billingRounds 才会取两次积分。
+ */
+section('WorkBuddy 计费键：跨会话重复只算一次')
+
+const wbDupNow = Date.now()
+const wbDupRoot = mkdtempSync(join(tmpdir(), 'wbtm-wb-dup-'))
+mkdirSync(join(wbDupRoot, 'projects', 'proj_dup'), { recursive: true })
+
+writeFileSync(
+  join(wbDupRoot, 'projects', 'proj_dup', 'sess_dup_a.jsonl'),
+  [
+    // 与 b 会话共用 req-dup-1，只是一处是「父会话的原生记录」、一处是「复制来的」
+    wbLine({ ts: wbDupNow - 5000, traceId: 'trace-dup-a1', convReqId: 'req-dup-1', input: 1000, output: 100 }),
+    wbLine({ ts: wbDupNow - 4000, traceId: 'trace-dup-a2', convReqId: 'req-dup-1', input: 800, output: 60 }),
+    // a 独有的计费回合，用来确认去重没有把正常的那一份也抹掉
+    wbLine({ ts: wbDupNow - 3000, traceId: 'trace-dup-a3', convReqId: 'req-dup-2', input: 500, output: 40 })
+  ].join('\n') + '\n'
+)
+writeFileSync(
+  join(wbDupRoot, 'projects', 'proj_dup', 'sess_dup_b.jsonl'),
+  wbLine({ ts: wbDupNow - 4500, traceId: 'trace-dup-b1', convReqId: 'req-dup-1', input: 1000, output: 100 }) + '\n'
+)
+
+const wbDupDb = new DatabaseSync(join(wbDupRoot, 'workbuddy.db'))
+wbDupDb.exec(`
+  CREATE TABLE sessions (
+    id TEXT PRIMARY KEY, title TEXT, cwd TEXT, model TEXT, status TEXT, updated_at INTEGER
+  );
+  CREATE TABLE session_usage (
+    session_id TEXT PRIMARY KEY, used INTEGER, size INTEGER, updated_at INTEGER, credit_json TEXT
+  );
+`)
+const insertWbDupSession = wbDupDb.prepare(
+  'INSERT INTO sessions (id, title, cwd, model, status, updated_at) VALUES (?, ?, ?, ?, ?, ?)'
+)
+insertWbDupSession.run('sess_dup_a', '重复键会话 A', 'D:\\proj\\dup', 'demo-model', 'idle', wbDupNow - 3000)
+insertWbDupSession.run('sess_dup_b', '重复键会话 B', 'D:\\proj\\dup', 'demo-model', 'idle', wbDupNow - 4500)
+const insertWbDupUsage = wbDupDb.prepare(
+  'INSERT INTO session_usage (session_id, used, size, updated_at, credit_json) VALUES (?, ?, ?, ?, ?)'
+)
+// 同一个键在两个会话的账本里都认 —— 数据库侧就是重复记账，本地侧只能算一次
+insertWbDupUsage.run('sess_dup_a', 2300, 300000, wbDupNow - 3000, JSON.stringify({ 'req-dup-1': 4, 'req-dup-2': 1 }))
+insertWbDupUsage.run('sess_dup_b', 1000, 300000, wbDupNow - 4500, JSON.stringify({ 'req-dup-1': 4 }))
+wbDupDb.close()
+
+const wbDup = collectSnapshot({ workbuddyDir: wbDupRoot, now: wbDupNow })
+
+check('跨会话重复：已归因不翻倍', near(wbDup.totals.attributedCredits, 5),
+  String(wbDup.totals.attributedCredits))
+check('跨会话重复：日积分之和 == 已归因积分',
+  near(sum(wbDup.days.map((d) => d.credits)), wbDup.totals.attributedCredits),
+  `${sum(wbDup.days.map((d) => d.credits))} vs ${wbDup.totals.attributedCredits}`)
+check('跨会话重复：模型积分之和 == 已归因积分',
+  near(sum(wbDup.models.map((m) => m.credits)), wbDup.totals.attributedCredits),
+  `${sum(wbDup.models.map((m) => m.credits))} vs ${wbDup.totals.attributedCredits}`)
+check('跨会话重复：今日积分也只算一次', near(wbDup.today.credits, 5), String(wbDup.today.credits))
+// token 是两边都真实发生的，不能跟着积分一起被去重掉
+check('跨会话重复不影响 token 合计', wbDup.totals.calls === 4, String(wbDup.totals.calls))
+
+rmSync(wbDupRoot, { recursive: true, force: true })
 
 /* ------------------------------------------------ 3c. 版本比较与更新状态 */
 
@@ -1710,6 +1788,72 @@ check(
 check('没有窗口的 override 不进表', reasonixWindows.get('opencode-go-3d75/missing') === undefined)
 check('providers 之外的 name 不会串块', reasonixWindows.get('plain-provider/context7') === undefined)
 
+section('Reasonix 新版会话文件解析')
+
+check(
+  'meta 的 preview 当标题，空白压成一行',
+  parseReasonixSessionPreview(JSON.stringify({ preview: '第一句   话\n第二句' })) === '第一句 话 第二句',
+  parseReasonixSessionPreview(JSON.stringify({ preview: '第一句   话\n第二句' }))
+)
+check('meta 里没有 preview 就是空标题', parseReasonixSessionPreview(JSON.stringify({ id: 'x' })) === '')
+check('meta 坏 JSON 返回空标题', parseReasonixSessionPreview('{ 半行') === '')
+
+const reasonixWorkspaceLine = (role: string, content: string): string => JSON.stringify({ role, content })
+check(
+  'cwd 从注入的 workspace 段里提，双反斜杠还原成单反斜杠',
+  parseReasonixMessageWorkspace(
+    reasonixWorkspaceLine('user', '<workspace>\nCurrent workspace: "D:\\\\AI\\\\github\\\\wb-token-meter". Shell commands')
+  ) === 'D:\\AI\\github\\wb-token-meter',
+  parseReasonixMessageWorkspace(
+    reasonixWorkspaceLine('user', '<workspace>\nCurrent workspace: "D:\\\\AI\\\\github\\\\wb-token-meter". Shell commands')
+  )
+)
+check(
+  '注入段落在首条 user 上，system 那条没有 —— 返回空',
+  parseReasonixMessageWorkspace(reasonixWorkspaceLine('system', 'You are Reasonix, a coding agent.')) === ''
+)
+check('坏 JSON 返回空', parseReasonixMessageWorkspace('{ 半行') === '')
+check('空行返回空', parseReasonixMessageWorkspace('') === '')
+
+check(
+  'wire 一行：只有 kind === usage 的才算账，模型从 costQuote.modelRef 取',
+  (() => {
+    const usage = parseReasonixWireLine(
+      JSON.stringify({
+        kind: 'usage',
+        usage: {
+          promptTokens: 20130,
+          completionTokens: 304,
+          cacheHitTokens: 97152,
+          reasoningTokens: 141,
+          costQuote: { modelRef: 'opencode-go-3d75/deepseek-flash' }
+        },
+        seq: 14
+      })
+    )
+    return (
+      usage?.inputTokens === 20130 &&
+      usage?.outputTokens === 304 &&
+      usage?.cachedTokens === 97152 &&
+      usage?.reasoningTokens === 141 &&
+      usage?.model === 'opencode-go-3d75/deepseek-flash'
+    )
+  })(),
+  '认领全靠这四个 token 数，必须原样读出来'
+)
+check(
+  'wire 里的非账行返回 null（stream_attempt / tool_dispatch / turn_started …）',
+  parseReasonixWireLine(JSON.stringify({ kind: 'stream_attempt', seq: 3 })) === null &&
+    parseReasonixWireLine(JSON.stringify({ kind: 'turn_started', text: '你好' })) === null
+)
+check(
+  'wire 里没记缓存的账照算，缓存记 0',
+  parseReasonixWireLine(JSON.stringify({ kind: 'usage', usage: { promptTokens: 100, completionTokens: 5 } }))
+    ?.cachedTokens === 0
+)
+check('wire 坏行返回 null', parseReasonixWireLine('{ 半行') === null)
+check('wire 空行返回 null', parseReasonixWireLine('') === null)
+
 section('Reasonix 目录扫描（临时夹具）')
 
 const reasonixRoot = mkdtempSync(join(tmpdir(), 'wbtm-reasonix-'))
@@ -1775,8 +1919,8 @@ writeFileSync(join(reasonixRoot, 'sessions', 'broken.meta.json'), '{ 坏 meta', 
 
 /* 新版桌面端的按天流水（<appData>/reasonix/stats/<YYYY-MM-DD>.jsonl）：
    没有 session 字段、ts 是 ISO 字符串、带 reasoning，还有 turn 标记行。
-   标题 / cwd 从兄弟目录借：desktop-sessions-v5/by-id 的 header.json 与
-   events.frames mtime，desktop/session-ui-v1.sqlite 的首条用户输入 */
+   会话归属来自隔壁的 projects/<项目>/sessions/<会话>.wire.jsonl —— 两边按
+   每次调用的四个 token 数逐行认领，认不出来的留在池子里 */
 const reasonixDesktopRoot = mkdtempSync(join(tmpdir(), 'wbtm-reasonix-desktop-'))
 const reasonixStatsRoot = join(reasonixDesktopRoot, 'stats')
 mkdirSync(reasonixStatsRoot, { recursive: true })
@@ -1785,6 +1929,7 @@ writeFileSync(
   join(reasonixStatsRoot, '2026-10-01.jsonl'),
   [
     JSON.stringify({ ts: isoOf(FIXED_NOW - 350), source: 'desktop', turn: true }),
+    /* 前两条在下面的 wire 里各有一条一模一样的账 —— 会被认领给对应会话 */
     JSON.stringify({
       ts: isoOf(FIXED_NOW - 400),
       source: 'desktop',
@@ -1808,46 +1953,81 @@ writeFileSync(
       total: 820,
       requests: 1
     }),
+    /* 这一条 wire 里没有 —— 认领不出去，留在池子里 */
+    JSON.stringify({
+      ts: isoOf(FIXED_NOW - 200),
+      source: 'desktop',
+      model: 'opencode-go-3d75/deepseek-flash',
+      prompt: 500,
+      completion: 10,
+      reasoning: 0,
+      total: 510,
+      requests: 1
+    }),
     '{ 半行',
     ''
   ].join('\n'),
   'utf8'
 )
 
-/* 两个桌面会话：新会话（标题来自首条 submission，mtime 最新 → 活跃）与旧会话 */
-const reasonixSid = 'desktop-manual-fixture1'
-const reasonixSidOld = 'desktop-manual-fixture0'
-const reasonixById = join(reasonixDesktopRoot, 'desktop-sessions-v5', 'by-id')
-for (const [sid, cwd] of [
-  [reasonixSid, 'D:\\工作台'],
-  [reasonixSidOld, 'D:\\旧项目']
-] as Array<[string, string]>) {
-  mkdirSync(join(reasonixById, sid), { recursive: true })
-  writeFileSync(join(reasonixById, sid, 'header.json'), JSON.stringify({ sessionId: sid, cwd }), 'utf8')
-  writeFileSync(join(reasonixById, sid, 'events.frames'), '占位 —— 采集器只 stat 不读', 'utf8')
-}
-/* 活跃判定靠 events.frames 的 mtime：新会话比一切调用都晚，旧会话比一切都早 */
-utimesSync(join(reasonixById, reasonixSid, 'events.frames'), new Date(FIXED_NOW - 100), new Date(FIXED_NOW - 100))
-utimesSync(join(reasonixById, reasonixSidOld, 'events.frames'), new Date(FIXED_NOW - 90000), new Date(FIXED_NOW - 90000))
+/* 两个新版会话：正文 <id>.jsonl、标题 <id>.jsonl.meta、调用账 <id>.wire.jsonl。
+   标题取 meta 的 preview，cwd 藏在正文开头注入的 Current workspace 段里 */
+const reasonixSid = '20261001-000000.000000000-fixture-a'
+const reasonixSidB = '20261001-000000.000000000-fixture-b'
+const reasonixSessionsDir = join(reasonixDesktopRoot, 'projects', 'd--proj-fixture', 'sessions')
+mkdirSync(reasonixSessionsDir, { recursive: true })
 
-/* 界面库：标题 = revision 最小的非空 submission 文本（多出来的空格要被压掉） */
-mkdirSync(join(reasonixDesktopRoot, 'desktop'), { recursive: true })
-const reasonixUi = new DatabaseSync(join(reasonixDesktopRoot, 'desktop', 'session-ui-v1.sqlite'))
-reasonixUi.exec('CREATE TABLE records (kind TEXT, key TEXT, revision INTEGER, payload TEXT)')
-const reasonixSubmission = (sid: string, revision: number, text: string): string =>
-  JSON.stringify({ ref: { sessionId: sid }, revision: String(revision), contentJson: JSON.stringify({ text }) })
-for (const [sid, revision, text] of [
-  [reasonixSid, 34, '后面的话'],
-  [reasonixSid, 12, '第一句  话'],
-  [reasonixSidOld, 3, '别的会话的标题']
-] as Array<[string, number, string]>) {
-  reasonixUi
-    .prepare("INSERT INTO records VALUES ('submission', ?, ?, ?)")
-    .run(`local:${sid}/composer-${revision}`, revision, reasonixSubmission(sid, revision, text))
-}
-reasonixUi.close()
+/* cwd 在正文里多转义了一层（两个反斜杠），采集器要还原成一个 —— 这里照着造 */
+const reasonixSessionBody = (cwd: string): string =>
+  [
+    JSON.stringify({ role: 'system', content: 'You are Reasonix, a coding agent.' }),
+    JSON.stringify({
+      role: 'user',
+      content: `<workspace>\nCurrent workspace: "${cwd.replace(/\\/g, '\\\\')}". Shell commands`
+    }),
+    ''
+  ].join('\n')
 
-/* config.toml：池子的模型窗口从这里解析（最后一次请求的模型带 override） */
+const reasonixWireLine = (
+  prompt: number,
+  completion: number,
+  cacheHit: number,
+  reasoning: number,
+  model: string
+): string =>
+  JSON.stringify({
+    kind: 'usage',
+    usage: {
+      promptTokens: prompt,
+      completionTokens: completion,
+      totalTokens: prompt + completion,
+      cacheHitTokens: cacheHit,
+      cacheMissTokens: prompt - cacheHit,
+      reasoningTokens: reasoning,
+      costQuote: { modelRef: model }
+    }
+  })
+
+for (const [sid, title, cwd, wireLines] of [
+  [reasonixSid, '第一句  话', 'D:\\工作台', [reasonixWireLine(900, 40, 700, 25, 'mimo-token-plan-cn/mimo-v2.5')]],
+  [reasonixSidB, '另一个会话', 'D:\\另一个项目', [reasonixWireLine(800, 20, 0, 10, 'opencode-go-3d75/deepseek-flash')]]
+] as Array<[string, string, string, string[]]>) {
+  writeFileSync(join(reasonixSessionsDir, `${sid}.jsonl`), reasonixSessionBody(cwd), 'utf8')
+  writeFileSync(
+    join(reasonixSessionsDir, `${sid}.jsonl.meta`),
+    JSON.stringify({ id: sid, model: 'fixture/model', preview: title }),
+    'utf8'
+  )
+  writeFileSync(join(reasonixSessionsDir, `${sid}.wire.jsonl`), [...wireLines, ''].join('\n'), 'utf8')
+  /* wire 里绝大多数行不是账 —— 混几行真的噪声进去，它们不该被算成调用 */
+  writeFileSync(
+    join(reasonixSessionsDir, `${sid}.events.jsonl`),
+    JSON.stringify({ kind: 'turn_started', text: '噪声' }) + '\n',
+    'utf8'
+  )
+}
+
+/* config.toml：会话 / 池子的模型窗口从这里解析（最后一次请求的模型带 override） */
 writeFileSync(
   join(reasonixDesktopRoot, 'config.toml'),
   [
@@ -1862,13 +2042,19 @@ writeFileSync(
 
 const reasonixLedgerPath = join(reasonixRoot, 'usage.jsonl')
 const reasonixFixture = collectReasonixSnapshot({ reasonixDir: reasonixRoot, statsDir: reasonixStatsRoot, now: FIXED_NOW })
+const reasonixSession = (sid: string): (typeof reasonixFixture.sessions)[number] | undefined =>
+  reasonixFixture.sessions.find((s) => s.sessionId === sid)
 
 check('kind 标记为 reasonix', reasonixFixture.kind === 'reasonix')
-check('扫到 3 个会话（老账 2 个 + 新账桌面端 1 个池子）', reasonixFixture.totals.sessions === 3, String(reasonixFixture.totals.sessions))
-check('半行 / 零 token / 缺 ts / turn 标记的行被丢掉', reasonixFixture.totals.calls === 6, String(reasonixFixture.totals.calls))
+check(
+  '扫到 5 个会话（老账 2 + 认领出的 2 个真会话 + 1 个池子）',
+  reasonixFixture.totals.sessions === 5,
+  String(reasonixFixture.totals.sessions)
+)
+check('半行 / 零 token / 缺 ts / turn 标记的行被丢掉', reasonixFixture.totals.calls === 7, String(reasonixFixture.totals.calls))
 check(
   '输入 = prompt（含缓存读），两本账并算',
-  reasonixFixture.totals.inputTokens === 1000 + 2000 + 300 + 500 + 900 + 800,
+  reasonixFixture.totals.inputTokens === 1000 + 2000 + 300 + 500 + 900 + 800 + 500,
   String(reasonixFixture.totals.inputTokens)
 )
 check(
@@ -1876,8 +2062,8 @@ check(
   reasonixFixture.totals.cachedTokens === 2700 + 700,
   String(reasonixFixture.totals.cachedTokens)
 )
-check('输出求和', reasonixFixture.totals.outputTokens === 200 + 40 + 20, String(reasonixFixture.totals.outputTokens))
-check('思考 token：新账单记、老账恒 0', reasonixFixture.totals.reasoningTokens === 25 + 10, String(reasonixFixture.totals.reasoningTokens))
+check('输出求和', reasonixFixture.totals.outputTokens === 200 + 70, String(reasonixFixture.totals.outputTokens))
+check('思考 token：新账单记、老账恒 0', reasonixFixture.totals.reasoningTokens === 35, String(reasonixFixture.totals.reasoningTokens))
 check(
   '所有粒度的积分都是 0',
   reasonixFixture.totals.credits === 0 &&
@@ -1887,50 +2073,73 @@ check(
 )
 check(
   '上下文水位取 meta 的 lastPromptTokens',
-  reasonixFixture.sessions.find((s) => s.sessionId === 'code-Agent')?.contextUsed === 2000,
-  String(reasonixFixture.sessions.find((s) => s.sessionId === 'code-Agent')?.contextUsed)
+  reasonixSession('code-Agent')?.contextUsed === 2000,
+  String(reasonixSession('code-Agent')?.contextUsed)
+)
+check('老账会话标题来自 meta.summary', reasonixSession('code-Agent')?.title === '夹具会话', reasonixSession('code-Agent')?.title)
+
+/* ---- 认领：官方账本的行按 token 值还给 wire 会话 ---- */
+check(
+  '真会话 A 认领到自己那一条，标题取 .jsonl.meta 的 preview',
+  reasonixSession(reasonixSid)?.calls === 1 && reasonixSession(reasonixSid)?.title === '第一句 话',
+  `${reasonixSession(reasonixSid)?.calls} 次 / ${reasonixSession(reasonixSid)?.title}`
 )
 check(
-  '老账会话标题来自 meta.summary',
-  reasonixFixture.sessions.find((s) => s.sessionId === 'code-Agent')?.title === '夹具会话',
-  reasonixFixture.sessions.find((s) => s.sessionId === 'code-Agent')?.title
+  '真会话 B 同样只认领到自己那条（不会串会话）',
+  reasonixSession(reasonixSidB)?.calls === 1 && reasonixSession(reasonixSidB)?.title === '另一个会话',
+  `${reasonixSession(reasonixSidB)?.calls} 次 / ${reasonixSession(reasonixSidB)?.title}`
 )
 check(
-  '池子标题 = 活跃桌面会话的首条用户输入（revision 最小那条，空格压掉）',
-  reasonixFixture.sessions.find((s) => s.sessionId === 'reasonix-desktop')?.title === '第一句 话',
-  reasonixFixture.sessions.find((s) => s.sessionId === 'reasonix-desktop')?.title
+  '真会话的 cwd 从正文开头提（双反斜杠还原成单反斜杠）',
+  reasonixSession(reasonixSid)?.cwd === 'D:\\工作台' && reasonixSession(reasonixSidB)?.cwd === 'D:\\另一个项目',
+  `${reasonixSession(reasonixSid)?.cwd} / ${reasonixSession(reasonixSidB)?.cwd}`
 )
 check(
-  '池子 cwd 借活跃会话 header.json 的 cwd（不借旧会话的）',
-  reasonixFixture.sessions.find((s) => s.sessionId === 'reasonix-desktop')?.cwd === 'D:\\工作台',
-  reasonixFixture.sessions.find((s) => s.sessionId === 'reasonix-desktop')?.cwd
+  '真会话的上下文水位取 wire 最后一条的 prompt',
+  reasonixSession(reasonixSid)?.contextUsed === 900,
+  String(reasonixSession(reasonixSid)?.contextUsed)
+)
+check(
+  '池子只剩认领不出去的那一条，并起了个能认出来的名字',
+  reasonixSession('reasonix-desktop')?.calls === 1 &&
+    reasonixSession('reasonix-desktop')?.title === '历史记录（无会话归属）',
+  `${reasonixSession('reasonix-desktop')?.calls} 次 / ${reasonixSession('reasonix-desktop')?.title}`
+)
+check(
+  '池子没有 meta，水位退回最后一次请求的输入',
+  reasonixSession('reasonix-desktop')?.contextUsed === 500,
+  String(reasonixSession('reasonix-desktop')?.contextUsed)
+)
+check(
+  '真会话也按最后一次请求的模型解析窗口（override 优先）',
+  reasonixSession(reasonixSidB)?.contextSize === 1000000,
+  String(reasonixSession(reasonixSidB)?.contextSize)
 )
 check(
   '池子窗口按最后一次请求的模型从 config.toml 解析（override 优先）',
-  reasonixFixture.sessions.find((s) => s.sessionId === 'reasonix-desktop')?.contextSize === 1000000,
-  String(reasonixFixture.sessions.find((s) => s.sessionId === 'reasonix-desktop')?.contextSize)
+  reasonixSession('reasonix-desktop')?.contextSize === 1000000,
+  String(reasonixSession('reasonix-desktop')?.contextSize)
 )
 check(
-  '老账会话的模型目录不落本地，窗口留 0',
-  reasonixFixture.sessions.every((s) => s.sessionId === 'reasonix-desktop' || s.contextSize === 0)
+  'config.toml 里没有的模型，窗口留 0（会话 A 用的是 mimo）',
+  reasonixSession(reasonixSid)?.contextSize === 0,
+  String(reasonixSession(reasonixSid)?.contextSize)
 )
 check(
-  '按 meta.workspace 分组，没有 meta 的退回会话名（新账落 reasonix-desktop 池子）',
+  '按会话 cwd 分组：真会话归自己的目录，池子退回会话名',
   reasonixFixture.projects.map((p) => p.projectDir).sort().join('|') ===
-    ['D:\\proj\\a', 'desktop-202605240306-1', 'reasonix-desktop'].sort().join('|'),
+    ['D:\\proj\\a', 'desktop-202605240306-1', 'D:\\工作台', 'D:\\另一个项目', 'reasonix-desktop'].sort().join('|'),
   reasonixFixture.projects.map((p) => p.projectDir).join('|')
 )
 check(
-  '活跃会话取最近有动静的（新账的行更新）',
+  '活跃会话取最近有动静的（认领不改变时间戳）',
   reasonixFixture.active?.sessionId === 'reasonix-desktop',
   String(reasonixFixture.active?.sessionId)
 )
 check(
-  '新账池子没有 meta，水位退回最后一次请求的输入',
-  reasonixFixture.sessions.find((s) => s.sessionId === 'reasonix-desktop')?.contextUsed === 800,
-  String(reasonixFixture.sessions.find((s) => s.sessionId === 'reasonix-desktop')?.contextUsed)
+  '认领是消费式的：会话 + 池子的用量之和 == 官方账本总量',
+  reasonixFixture.totals.inputTokens === 1000 + 2000 + 300 + 500 + 900 + 800 + 500
 )
-check('子代理的调用并进原会话（老账 2 个 + 新账 1 个池子）', reasonixFixture.totals.sessions === 3)
 
 const reasonixStatBefore = statSync(reasonixLedgerPath)
 const reasonixStatsFileBefore = statSync(join(reasonixStatsRoot, '2026-10-01.jsonl'))
@@ -1946,15 +2155,15 @@ check(
 )
 
 check(
-  '只有一本账也照读：老账缺失 → 新账 1 池 2 调用；新账缺失 → 老账 2 会话 4 调用',
+  '只有一本账也照读：老账缺失 → 新账 2 真会话 + 1 池 3 调用；新账缺失 → 老账 2 会话 4 调用',
   (() => {
     const emptyRoot = mkdtempSync(join(tmpdir(), 'wbtm-reasonix-empty-'))
     try {
       const onlyStats = collectReasonixSnapshot({ reasonixDir: emptyRoot, statsDir: reasonixStatsRoot, now: FIXED_NOW })
       const onlyLedger = collectReasonixSnapshot({ reasonixDir: reasonixRoot, statsDir: emptyRoot, now: FIXED_NOW })
       return (
-        onlyStats.totals.calls === 2 &&
-        onlyStats.totals.sessions === 1 &&
+        onlyStats.totals.calls === 3 &&
+        onlyStats.totals.sessions === 3 &&
         onlyLedger.totals.calls === 4 &&
         onlyLedger.totals.sessions === 2
       )
@@ -1966,6 +2175,88 @@ check(
 
 rmSync(reasonixRoot, { recursive: true, force: true })
 rmSync(reasonixDesktopRoot, { recursive: true, force: true })
+
+/* ------------------------------- Reasonix 新版按项目落盘的会话（2.x） */
+
+section('Reasonix 新版按项目落盘的会话')
+
+/* 这一组专测**降级**：会话目录在、但 wire 是空的（引擎换了格式，或还没写到那步）。
+   此时一条调用也认领不出去，全部退回池子 —— 采集器不能把会话硬编出来。 */
+const reasonixProjectRoot = mkdtempSync(join(tmpdir(), 'wbtm-reasonix-project-'))
+const reasonixProjectStats = join(reasonixProjectRoot, 'stats')
+mkdirSync(reasonixProjectStats, { recursive: true })
+writeFileSync(
+  join(reasonixProjectStats, '2026-10-06.jsonl'),
+  [
+    JSON.stringify({
+      ts: isoOf(FIXED_NOW - 200),
+      source: 'desktop',
+      model: 'opencode-go-3d75/deepseek-flash',
+      prompt: 500,
+      completion: 50,
+      reasoning: 20,
+      cache_hit: 400,
+      cache_miss: 100,
+      total: 550,
+      requests: 1
+    }),
+    ''
+  ].join('\n'),
+  'utf8'
+)
+
+const reasonixProjectSessions = join(reasonixProjectRoot, 'projects', 'd--ai-github-wb-token-meter', 'sessions')
+mkdirSync(reasonixProjectSessions, { recursive: true })
+const reasonixProjectId = '20261006-074640.643018400-deepseek-flash'
+/* 注入的 <workspace> 段落在首条 user 消息上（system 那条不带），路径多转义一层 */
+writeFileSync(
+  join(reasonixProjectSessions, `${reasonixProjectId}.jsonl`),
+  [
+    JSON.stringify({ role: 'system', content: 'You are Reasonix, a coding agent.' }),
+    JSON.stringify({
+      role: 'user',
+      content: '<workspace>\nCurrent workspace: "D:\\\\AI\\\\github\\\\wb-token-meter". Shell commands'
+    })
+  ].join('\n'),
+  'utf8'
+)
+writeFileSync(
+  join(reasonixProjectSessions, `${reasonixProjectId}.jsonl.meta`),
+  JSON.stringify({ id: reasonixProjectId, model: 'opencode-go-3d75/deepseek-flash', preview: '帮我看下新版数据采集' }),
+  'utf8'
+)
+/* 配套事件流与索引文件不该被当成第二个会话 */
+writeFileSync(join(reasonixProjectSessions, `${reasonixProjectId}.events.jsonl`), '{}\n', 'utf8')
+writeFileSync(join(reasonixProjectSessions, `${reasonixProjectId}.wire.jsonl`), '{}\n', 'utf8')
+writeFileSync(join(reasonixProjectSessions, `${reasonixProjectId}.display-index.json`), '{}\n', 'utf8')
+
+const reasonixProjectFixture = collectReasonixSnapshot({
+  reasonixDir: join(reasonixProjectRoot, 'no-such-home'),
+  statsDir: reasonixProjectStats,
+  now: FIXED_NOW
+})
+const reasonixProjectPool = reasonixProjectFixture.sessions.find((s) => s.sessionId === 'reasonix-desktop')
+
+check('新版按项目落盘的流水照样读出用量', reasonixProjectFixture.totals.calls === 1, String(reasonixProjectFixture.totals.calls))
+check(
+  '会话没有 wire 就认领不出去 —— 退回一个池子，不会被当成真会话',
+  reasonixProjectFixture.totals.sessions === 1,
+  String(reasonixProjectFixture.totals.sessions)
+)
+check('活跃会话就是它', reasonixProjectFixture.active?.sessionId === 'reasonix-desktop', String(reasonixProjectFixture.active?.sessionId))
+check(
+  '池子的标题是「历史记录（无会话归属）」，不再借别人的名字',
+  reasonixProjectPool?.title === '历史记录（无会话归属）',
+  reasonixProjectPool?.title
+)
+check('池子不编造 cwd（界面按会话名分组）', reasonixProjectPool?.cwd === '', `[${reasonixProjectPool?.cwd}]`)
+check(
+  '新版仓里没有 config.toml 时窗口留 0（界面退回只报已用量）',
+  reasonixProjectPool?.contextSize === 0,
+  String(reasonixProjectPool?.contextSize)
+)
+
+rmSync(reasonixProjectRoot, { recursive: true, force: true })
 
 section('Reasonix 真实数据')
 
@@ -1999,9 +2290,9 @@ if (!hasReasonix) {
   if (hasReasonixStats) {
     check('新版流水有思考 token', reasonixReal.totals.reasoningTokens > 0, String(reasonixReal.totals.reasoningTokens))
     check(
-      '桌面池子借到了活跃会话的标题',
-      (reasonixReal.sessions.find((s) => s.sessionId === 'reasonix-desktop')?.title ?? '').length > 0,
-      reasonixReal.sessions.find((s) => s.sessionId === 'reasonix-desktop')?.title
+      '新版会话按 wire 认领出来了（不止一个池子）',
+      reasonixReal.sessions.some((s) => s.sessionId !== 'reasonix-desktop' && s.title.length > 0),
+      reasonixReal.sessions.map((s) => s.sessionId).join(' / ')
     )
   }
   check(
@@ -2016,11 +2307,10 @@ if (!hasReasonix) {
   )
   check('缓存命中不超过输入', reasonixReal.totals.cachedTokens <= reasonixReal.totals.inputTokens)
   check('有活跃会话', reasonixReal.active !== null)
-  /* 标题 / 工作目录只有老账本（meta.json）才拿得到 —— 只有新版数据的机器上这两项天然为空 */
-  if (existsSync(join(reasonixDirPath, 'usage.jsonl'))) {
-    check('至少一个会话带标题', reasonixReal.sessions.some((s) => s.title.length > 0))
-    check('至少一个会话带工作目录', reasonixReal.sessions.some((s) => s.cwd.length > 0))
-  }
+  /* 标题与工作目录现在两条路都有：老账取 meta.json 的 summary / workspace，
+     新账取 .jsonl.meta 的 preview 与正文开头注入的 Current workspace 段 */
+  check('至少一个会话带标题', reasonixReal.sessions.some((s) => s.title.length > 0))
+  check('至少一个会话带工作目录', reasonixReal.sessions.some((s) => s.cwd.length > 0))
 }
 
 check(
@@ -2363,12 +2653,12 @@ if (!hasDsh) {
 check('DSH 目录不存在不崩', collectDshSnapshot({ dshDir: join(homedir(), '.dsh-nonexistent') }).sessions.length === 0)
 check('路径为空不崩', collectDshSnapshot({ dshDir: '' }).sessions.length === 0)
 
-/* ---------------------------------------------- 6c. TRAE SOLO CN 数据源 */
+/* ---------------------------------------------- 6c. Trae CN 数据源 */
 
-section('TRAE SOLO CN 用量库解密（临时夹具）')
+section('Trae CN 用量库解密（临时夹具）')
 
 /*
- * 真实账本是 SQLCipher 4 加密的，而密钥只存在于 TraeWork 进程的内存里 ——
+ * 真实账本是 SQLCipher 4 加密的，而密钥只存在于 Trae CN 进程的内存里 ——
  * CI 上既没有库、也没有钥匙。所以这里**在明文里现建一个同构库，再按实物规则逐页加密**：
  * 页布局、裸 key、不补位的 CBC、以及带残留旧帧的 WAL 都照实来。
  * 这一段专门盯三件最容易写错的事：
@@ -2868,24 +3158,26 @@ writeFileSync(traeCnStampDb, Buffer.concat([...traeCnSealedA.sealed, Buffer.allo
 check('库长了文件戳就变', traeCnFileStamp(traeCnStampDb) !== traeCnStamp1)
 check('库不存在时文件戳为 null 而不是抛异常', traeCnFileStamp(join(traeCnRoot, 'nope.db')) === null)
 
-section('TRAE SOLO CN 真实数据')
+section('Trae CN 真实数据')
 
+/* 2026-10 起产品从 TRAE SOLO CN 升级成 Trae CN（只改名、不迁数据），两个目录可能并存
+   —— 与 src/main/paths.ts 的 traeCnBaseName() 同口径：优先新目录、旧目录兜底。 */
+const traeCnAppData = process.env['APPDATA'] ?? join(homedir(), 'AppData', 'Roaming')
+const traeCnBase = existsSync(join(traeCnAppData, 'Trae CN'))
+  ? 'Trae CN'
+  : existsSync(join(traeCnAppData, 'TRAE SOLO CN'))
+    ? 'TRAE SOLO CN'
+    : 'Trae CN'
 const traeCnRealDir =
   process.env['WB_TOKEN_METER_TRAECN_DIR'] ??
-  join(process.env['APPDATA'] ?? join(homedir(), 'AppData', 'Roaming'), 'TRAE SOLO CN', 'ModularData', 'ai-agent')
+  join(traeCnAppData, traeCnBase, 'ModularData', 'ai-agent')
 const traeCnRealDb = join(traeCnRealDir, 'database.db')
 const traeCnRealState =
   process.env['WB_TOKEN_METER_TRAECN_STATE'] ??
-  join(
-    process.env['APPDATA'] ?? join(homedir(), 'AppData', 'Roaming'),
-    'TRAE SOLO CN',
-    'User',
-    'globalStorage',
-    'state.vscdb'
-  )
+  join(traeCnAppData, traeCnBase, 'User', 'globalStorage', 'state.vscdb')
 const traeCnKeyHex = process.env['WB_TOKEN_METER_TRAECN_KEY'] ?? ''
 
-/* 密钥只在 TraeWork 进程的内存里，磁盘 / 注册表 / DPAPI 全无落点 ——
+/* 密钥只在 Trae CN 进程的内存里，磁盘 / 注册表 / DPAPI 全无落点 ——
    所以真实数据这一段必须由外部把密钥递进来（WB_TOKEN_METER_TRAECN_KEY=<64 hex>），
    否则只能跳过。CI 上必然跳过，属正常。 */
 if (!existsSync(traeCnRealDb) || !/^[0-9a-fA-F]{64}$/.test(traeCnKeyHex)) {
@@ -4115,6 +4407,173 @@ async function main(): Promise<void> {
       check('目录里没有模型窗口也算失败', (await catalog.pull()) === false)
     })
 
+    /* --------------------------------------------- Trae CN 云端积分 */
+
+    section('Trae CN 云端积分')
+
+    /* 实测响应裁剪版：usage_summary + 两个有效额度包 + 一条无上限的「免费」+
+       「签到奖励」重复三条 —— 合并与跳过就靠这几条验。 */
+    const TRAECN_CREDITS_BODY = JSON.stringify({
+      is_credits_billing: true,
+      usage_summary: { consumed_amount: 499.2716, consumption_ratio: 0.0924577037037037, total_amount: 5400 },
+      user_entitlement_pack_list: [
+        { display_desc: '老用户福利', entitlement_base_info: { quota: { credits_limit: 4000 } } },
+        { display_desc: '免费', entitlement_base_info: { quota: { enable_solo_ide: true } } },
+        { display_desc: '每月登录赠送', entitlement_base_info: { quota: { credits_limit: 500 } } },
+        { display_desc: '签到奖励', entitlement_base_info: { quota: { credits_limit: 100 } } },
+        { display_desc: '签到奖励', entitlement_base_info: { quota: { credits_limit: 100 } } },
+        { display_desc: '签到奖励', entitlement_base_info: { quota: { credits_limit: 100 } } }
+      ]
+    })
+
+    const creditsParsed = parseCreditsResponse(JSON.parse(TRAECN_CREDITS_BODY))
+    check(
+      '解析出已用与总额',
+      creditsParsed?.consumed === 499.2716 && creditsParsed?.total === 5400,
+      JSON.stringify(creditsParsed)
+    )
+    check('比例取服务端给的值', creditsParsed?.ratio === 0.0924577037037037, String(creditsParsed?.ratio))
+    check(
+      '额度包按 desc 合并、按上限降序',
+      describeCreditPacks(creditsParsed?.packs ?? []) === '老用户福利 4000 · 每月登录赠送 500 · 签到奖励 300',
+      describeCreditPacks(creditsParsed?.packs ?? [])
+    )
+    check('没有 credits_limit 的包被跳过', (creditsParsed?.packs ?? []).every((pack) => pack.desc !== '免费'))
+
+    check('少了 usage_summary 就不认这本账', parseCreditsResponse({ user_entitlement_pack_list: [] }) === null)
+    check('usage_summary 不是对象也不认', parseCreditsResponse({ usage_summary: 'x' }) === null)
+    check('响应压根不是对象也返回 null', parseCreditsResponse(null) === null)
+    check(
+      '服务端没给比例就按 已用÷总额 算',
+      parseCreditsResponse({ usage_summary: { consumed_amount: 500, total_amount: 1000 } })?.ratio === 0.5
+    )
+    check(
+      '比例越界时退回自算',
+      parseCreditsResponse({ usage_summary: { consumed_amount: 500, total_amount: 1000, consumption_ratio: 3 } })
+        ?.ratio === 0.5
+    )
+    const zeroTotalCredits = parseCreditsResponse({ usage_summary: { consumed_amount: 12, total_amount: 0 } })
+    check(
+      '总额为 0 时比例按 0，已用照旧',
+      zeroTotalCredits?.ratio === 0 && zeroTotalCredits?.consumed === 12,
+      JSON.stringify(zeroTotalCredits)
+    )
+    check('负数被夹回 0', parseCreditsResponse({ usage_summary: { consumed_amount: -5, total_amount: -1 } })?.consumed === 0)
+    check('401 的文案说的是凭证、不是网络', describeCreditsHttpError(401).includes('登录凭证'))
+    check('500 的文案带状态码', describeCreditsHttpError(500).includes('500'))
+    check('默认端点指向 v2 权益接口', DEFAULT_CREDITS_ENDPOINT.endsWith('/api/v2/pay/user_current_entitlement_list'))
+
+    /* 假 fetch：按顺序吐预先排好的响应，并记下每次请求的头与体。
+       积分这支不碰真网络 —— 扫描内存捞 JWT 是另一条链路，这里只验「拿到候选之后」。 */
+    const fakeCreditsFetch = (
+      replies: { status: number; body?: unknown }[]
+    ): { impl: typeof fetch; calls: { url: string; headers: Record<string, string>; method: string; body: unknown }[] } => {
+      const calls: { url: string; headers: Record<string, string>; method: string; body: unknown }[] = []
+      let index = 0
+      const impl = (async (url: unknown, init?: RequestInit): Promise<Response> => {
+        calls.push({
+          url: String(url),
+          headers: (init?.headers as Record<string, string>) ?? {},
+          method: init?.method ?? 'GET',
+          body: init?.body
+        })
+        const reply = replies[Math.min(index, replies.length - 1)]
+        index += 1
+        return new Response(reply.body === undefined ? '' : JSON.stringify(reply.body), {
+          status: reply.status,
+          headers: { 'content-type': 'application/json' }
+        })
+      }) as unknown as typeof fetch
+      return { impl, calls }
+    }
+
+    const CREDITS_AUTH_FAIL = { status: 401, body: { code: 1001, message: 'unauthorized' } }
+    const CREDITS_OK = { status: 200, body: JSON.parse(TRAECN_CREDITS_BODY) as unknown }
+    const CREDITS_ENDPOINT = 'http://127.0.0.1:1/trae/api/v2/pay/user_current_entitlement_list'
+
+    const picking = fakeCreditsFetch([CREDITS_AUTH_FAIL, CREDITS_OK])
+    const pickUsage = new TraeCnUsage({ endpoint: CREDITS_ENDPOINT, now: () => clock, fetchImpl: picking.impl })
+    check('候选里只有一支有效也能验出来', (await pickUsage.pull(['jwt_stale', 'jwt_real'])) === true)
+    check('作废那支也真试过', picking.calls.length === 2, String(picking.calls.length))
+    check(
+      '请求头是 Cloud-IDE-JWT + 候选',
+      picking.calls[0]?.headers['authorization'] === 'Cloud-IDE-JWT jwt_stale',
+      picking.calls[0]?.headers['authorization'] ?? '(空)'
+    )
+    check('打到注入的端点用 POST + 空 JSON 体', picking.calls[0]?.url === CREDITS_ENDPOINT && picking.calls[0]?.method === 'POST' && picking.calls[0]?.body === '{}')
+    check(
+      '账上落了已用 / 总额',
+      pickUsage.current().data?.consumed === 499.2716 && pickUsage.current().data?.total === 5400,
+      JSON.stringify(pickUsage.current().data)
+    )
+    check('凭证描述只说来源、不含 token', pickUsage.credentialLabel().includes('内存') && !pickUsage.credentialLabel().includes('jwt_real'))
+
+    tick(60_000 + 1)
+    check('验过的凭证被缓存，下一轮只带它', (await pickUsage.pull([])) === true && picking.calls.length === 3)
+    check(
+      '缓存的就是那支有效的',
+      picking.calls[2]?.headers['authorization'] === 'Cloud-IDE-JWT jwt_real',
+      picking.calls[2]?.headers['authorization'] ?? '(空)'
+    )
+    tick(1_000)
+    check('最小间隔内不再发请求', (await pickUsage.pull([])) === false && picking.calls.length === 3)
+    check('force 能顶开节流', (await pickUsage.pull([], true)) === true && picking.calls.length === 4)
+
+    const allDead = fakeCreditsFetch([CREDITS_AUTH_FAIL])
+    const deadUsage = new TraeCnUsage({ endpoint: CREDITS_ENDPOINT, now: () => clock, fetchImpl: allDead.impl })
+    check('全部候选都不认账时 pull=false', (await deadUsage.pull(['a', 'b', 'c'])) === false)
+    check('每支候选都试了一次', allDead.calls.length === 3, String(allDead.calls.length))
+    check('错误说的是凭证失效', (deadUsage.current().error ?? '').includes('登录凭证'))
+    check('从没成功过就不算 stale', deadUsage.current().stale === false && deadUsage.current().fetchedAt === 0)
+    check('取不到积分时 data 为空', deadUsage.current().data === null)
+
+    const capped = fakeCreditsFetch([CREDITS_AUTH_FAIL])
+    const cappedUsage = new TraeCnUsage({ endpoint: CREDITS_ENDPOINT, now: () => clock, fetchImpl: capped.impl })
+    check(
+      '候选多过上限时只验前 40 支',
+      (await cappedUsage.pull(Array.from({ length: 60 }, (_, index) => `jwt_${index}`))) === false
+    )
+    check('也就是 40 次请求', capped.calls.length === 40, String(capped.calls.length))
+
+    const emptyUsage = new TraeCnUsage({
+      endpoint: CREDITS_ENDPOINT,
+      now: () => clock,
+      fetchImpl: fakeCreditsFetch([]).impl
+    })
+    check('压根没候选就不发请求', (await emptyUsage.pull([])) === false)
+    check('提示说的是没取到凭证', (emptyUsage.current().error ?? '').includes('没取到 Trae CN 的登录凭证'))
+
+    let networkCalls = 0
+    const throwingFetch = (async (): Promise<Response> => {
+      networkCalls += 1
+      throw new Error('boom')
+    }) as unknown as typeof fetch
+    const brokenUsage = new TraeCnUsage({ endpoint: CREDITS_ENDPOINT, now: () => clock, fetchImpl: throwingFetch })
+    check('网络错误时 pull=false', (await brokenUsage.pull(['a', 'b', 'c'])) === false)
+    check('网络错误不再把剩下几支也打一遍', networkCalls === 1, String(networkCalls))
+    check('网络错误的原因如实报出来', brokenUsage.current().error === 'boom', String(brokenUsage.current().error))
+
+    const timeoutFetch = (async (): Promise<Response> => {
+      throw Object.assign(new Error('timed out'), { name: 'TimeoutError' })
+    }) as unknown as typeof fetch
+    const timeoutUsage = new TraeCnUsage({ endpoint: CREDITS_ENDPOINT, now: () => clock, fetchImpl: timeoutFetch })
+    check('超时被翻成中文', (await timeoutUsage.pull(['a'])) === false && timeoutUsage.current().error === '请求超时')
+
+    const nonCreditsBody = fakeCreditsFetch([{ status: 200, body: { user_entitlement_pack_list: [] } }])
+    const wrongShape = new TraeCnUsage({ endpoint: CREDITS_ENDPOINT, now: () => clock, fetchImpl: nonCreditsBody.impl })
+    check('200 但响应里没有 usage_summary 也算失败', (await wrongShape.pull(['a'])) === false)
+    check('这种失败会说出少了什么', (wrongShape.current().error ?? '').includes('usage_summary'))
+
+    const flaky = fakeCreditsFetch([CREDITS_OK, CREDITS_AUTH_FAIL])
+    const flakyUsage = new TraeCnUsage({ endpoint: CREDITS_ENDPOINT, now: () => clock, fetchImpl: flaky.impl })
+    check('第一次成功', (await flakyUsage.pull(['good'])) === true)
+    tick(60_000 + 1)
+    check('之后失败时 pull=false', (await flakyUsage.pull(['good'])) === false)
+    check('旧值留着不丢', flakyUsage.current().data?.total === 5400, JSON.stringify(flakyUsage.current().data))
+    check('并标记为陈旧', flakyUsage.current().stale === true)
+    check('失败原因也带着', (flakyUsage.current().error ?? '').length > 0, String(flakyUsage.current().error))
+    check('退避期内不再发请求', (await flakyUsage.pull(['good'])) === false && flaky.calls.length === 2)
+
     /* --------------------------------------------- 多源隔离 */
 
     section('十个数据源互不影响')
@@ -4138,7 +4597,7 @@ async function main(): Promise<void> {
     const dshCache = new Map()
     collectDshSnapshot({ dshDir: dshDirPath, cache: dshCache, now: FIXED_NOW })
     collectOpencodeSnapshot({ opencodeDir: opencodeDataPath, cacheDir: opencodeCachePath, now: FIXED_NOW })
-    /* TRAE SOLO CN 没有解析缓存（每次都要重新解密），这里再采一次是为了证明
+    /* Trae CN 没有解析缓存（每次都要重新解密），这里再采一次是为了证明
        回放出来的结果稳定、且不会串到别的源 */
     const traeCnRepeat = collectTraeCnSnapshot({ dbPath: traeCnDbFile, key: traeCnKey, now: FIXED_NOW })
 
@@ -4223,7 +4682,7 @@ async function main(): Promise<void> {
     check('读到 Reasonix 数据时缓存确实用上了', !hasReasonix || reasonixCache.size > 0, `${reasonixCache.size} 项`)
     check('读到 DSH 数据时缓存确实用上了', !hasDsh || dshCache.size > 0, `${dshCache.size} 项`)
     check(
-      'TRAE SOLO CN 反复采集结果一致（没有会串味的共享状态）',
+      'Trae CN 反复采集结果一致（没有会串味的共享状态）',
       traeCnRepeat.totals.calls === traeCnB.totals.calls && traeCnRepeat.totals.inputTokens === traeCnB.totals.inputTokens,
       `${traeCnRepeat.totals.calls} 次 / ${traeCnRepeat.totals.inputTokens} token`
     )
@@ -4243,7 +4702,7 @@ async function main(): Promise<void> {
         sourceLabel('qoder') === 'Qoder CN' &&
         sourceLabel('reasonix') === 'Reasonix' &&
         sourceLabel('dsh') === 'DeepSeek Harness' &&
-        sourceLabel('traecn') === 'TRAE SOLO CN' &&
+        sourceLabel('traecn') === 'Trae CN' &&
         SOURCE_ORDER.length === 10,
       SOURCE_ORDER.join('/')
     )

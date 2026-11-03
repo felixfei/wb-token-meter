@@ -16,6 +16,7 @@ import { collectZcodeSnapshot } from '../shared/zcode-collector'
 import type {
   AppInfo,
   CapsuleTheme,
+  CreditsInfo,
   FloatState,
   Settings,
   Snapshot,
@@ -26,6 +27,7 @@ import type {
 import { FloatWindow } from './float'
 import { ModelsDevCatalog } from './modelsdev'
 import { OpencodeUsage } from './opencode-usage'
+import { TraeCnUsage } from './traecn-usage'
 import {
   appIconPath,
   dshDir,
@@ -64,11 +66,11 @@ const SMOKE_EXIT = process.env['WB_TOKEN_METER_SMOKE_EXIT'] === '1'
 const SMOKE_TIMEOUT_MS = 120_000
 
 /**
- * 首屏那一拍延后多久量。
+ * 切到 traecn 之后等多久量首屏。
  *
- * 要够早 —— 早到 traecn 还在扫密钥（那台机器实测 ~21 秒），早到能看见骨架；
- * 也要够晚 —— 晚到首帧真的画出来了（否则量到的是空白页，不是「画成了 0」）。
- * 800ms 落在两者之间：首屏那一下 refresh() 是同步的，早于它画不出东西。
+ * 要够晚 —— 晚到首帧真的画出来了（否则量到的是空白页，不是「画成了 0」）；
+ * 也只要够晚 —— traecn 要扫二十几秒密钥，这段等待**不会**盖住它。800ms
+ * 落在两者之间：首屏那一下 refresh() 是同步的，早于它画不出东西。
  */
 const SMOKE_FIRST_PAINT_MS = 800
 
@@ -132,9 +134,9 @@ const reasonixCache: ReasonixParseCache = new Map()
 const dshCache: DshParseCache = new Map()
 
 /**
- * TRAE SOLO CN 的数据库密钥。**必须缓存**：唯一能取到它的办法是扫那些锁着
- * 用量库的进程的内存（实测 ~680MB / 21 秒），而 20 秒一次的轮询扛不住这个代价。
- * 同一份 TraeWork 不重启，密钥就一直有效 —— 所以只有第 1 页 HMAC 验不过
+ * Trae CN 的数据库密钥。**必须缓存**：唯一能取到它的办法是扫那些锁着
+ * 用量库的进程的内存（实测 ~680MB、20~30 秒），而 20 秒一次的轮询扛不住这个代价。
+ * 同一份 Trae CN 不重启，密钥就一直有效 —— 所以只有第 1 页 HMAC 验不过
  * （App 重启换了钥）才重扫，见 ensureTraeCnKey()。
  */
 let traeCnKey: Buffer | null = null
@@ -147,7 +149,7 @@ let traeCnKeyCheckedAt = 0
 const TRAECN_KEY_RETRY_MS = 60_000
 
 /**
- * TRAE SOLO CN 的快照缓存：db + -wal 的文件戳没变就整份复用（见 refresh() 的
+ * Trae CN 的快照缓存：db + -wal 的文件戳没变就整份复用（见 refresh() 的
  * traecn 分支）。只缓存「有钥」时采的那份 —— 没钥的空账本来就不花钱，而且
  * 钥从无到有的那一拍必须真的重采，不能被上一份「没钥」的空账挡住。
  */
@@ -166,7 +168,7 @@ function ensureTraeCnKey(force = false): Promise<void> {
       traeCnKey = probe.key
     })
     .catch(() => {
-      traeCnKeyProbe = { pids: [], key: null }
+      traeCnKeyProbe = { pids: [], key: null, tokens: [] }
       traeCnKey = null
     })
     .finally(() => {
@@ -320,6 +322,38 @@ function buildOpencodeSnapshot(): Snapshot {
   }
 }
 
+/** Trae CN 云端积分的客户端。懒创建：只有真的切到 traecn 才会实例化、才会打接口 */
+let traeCnUsage: TraeCnUsage | null = null
+
+function ensureTraeCnUsage(): TraeCnUsage {
+  if (!traeCnUsage) {
+    traeCnUsage = new TraeCnUsage({ endpoint: process.env['WB_TOKEN_METER_TRAECN_CREDITS_URL'] })
+  }
+  return traeCnUsage
+}
+
+/**
+ * 积分卡要的那份数据。
+ *
+ * 这里只做「把客户端的内部状态摊成界面认的形状」；取数的节奏（节流 / 退避 /
+ * 去重）全在 TraeCnUsage 里，跟额度源一模一样 —— 别在刷新这一侧再叠一层判断。
+ */
+function traeCnCreditsInfo(usage: TraeCnUsage): CreditsInfo {
+  const state = usage.current()
+  return {
+    consumed: state.data?.consumed ?? 0,
+    total: state.data?.total ?? 0,
+    // 服务端给 0..1，界面要 0..100：换算只做一次，就放在这里
+    percent: Math.round((state.data?.ratio ?? 0) * 1000) / 10,
+    packs: state.data?.packs ?? [],
+    fetchedAt: state.fetchedAt,
+    stale: state.stale,
+    error: state.error,
+    endpoint: usage.endpoint,
+    credential: usage.credentialLabel()
+  }
+}
+
 function refresh(force = false): Snapshot | null {
   const kind = currentSource()
   try {
@@ -350,11 +384,11 @@ function refresh(force = false): Snapshot | null {
       snapshot = collectDshSnapshot({ dshDir: sourceDir(kind), cache: dshCache })
     } else if (kind === 'traecn') {
       const dbPath = traeCnDbPath()
-      // 缓存的密钥要先验一页 HMAC 再用：TraeWork 重启会换钥，直接拿旧钥去解密
+      // 缓存的密钥要先验一页 HMAC 再用：Trae CN 重启会换钥，直接拿旧钥去解密
       // 只会得到一库乱码 —— 而乱码很像「库坏了」，特别容易查错方向。
       if (traeCnKey && !probeTraeCnKey(dbPath, traeCnKey)) traeCnKey = null
       // 有钥且 db+wal 都没动过，就别每 20 秒把「拷库 + 逐页 AES + 回放 WAL」整价
-      // 再付一遍：TraeWork 关着的时候库是死的，重解出来的全是同一份内容。
+      // 再付一遍：Trae CN 关着的时候库是死的，重解出来的全是同一份内容。
       // 手动刷新（force）绕开缓存 —— 用户点「刷新」就该是真的重读一遍。
       const stamp = traeCnKey ? traeCnFileStamp(dbPath) : null
       if (stamp && !force && traeCnStampCache?.stamp === stamp) {
@@ -367,12 +401,12 @@ function refresh(force = false): Snapshot | null {
       }
       if (!traeCnKey && traeCnKeyProbe) {
         // 说真话：扫描还没跑完时不能说「App 没在跑」—— 那时候根本还不知道
-        // TraeWork 开没开。这两种情况对用户的动作完全不同（等 vs 去启动它），
+        // Trae CN 开没开。这两种情况对用户的动作完全不同（等 vs 去启动它），
         // 混成一条提示只会让人以为真出问题了。
         snapshot.warnings.push(
           traeCnKeyProbe.pids.length
-            ? `TRAE SOLO CN 正在运行（pid ${traeCnKeyProbe.pids.join(',')}），但没在那个进程的内存里认出数据库密钥`
-            : 'TRAE SOLO CN 当前没有运行，读不到用量 —— 这个数据源的密钥只存在于它的进程内存里'
+            ? `Trae CN 正在运行（pid ${traeCnKeyProbe.pids.join(',')}），但没在那个进程的内存里认出数据库密钥`
+            : 'Trae CN 当前没有运行，读不到用量 —— 这个数据源的密钥只存在于它的进程内存里'
         )
       }
       // 取密钥要扫 ~680MB 内存（21 秒量级），绝不能挡住这次刷新：
@@ -386,12 +420,25 @@ function refresh(force = false): Snapshot | null {
       if (!traeCnKey && !traeCnKeyProbe) {
         snapshot.pending = 'key-scan'
         // 采集器自己那条「没取到密钥（没在运行？）」在扫描期间是**假的** ——
-        // 那时候还没开始扫，根本不知道 TraeWork 开没开。留着它等于同时说
+        // 那时候还没开始扫，根本不知道 Trae CN 开没开。留着它等于同时说
         // 「正在读」和「读不到」，界面会自己打架。骨架里本来就会说明在等什么。
         snapshot.warnings = snapshot.warnings.filter((warning) => !warning.includes('密钥'))
       }
+      // 积分单独挂上去，**不能跟着 token 那本 stamp 缓存走**：库没动不代表积分没动
+      // （积分是每用完一次就从云端扣的）。stamp 命中时 snapshot 是缓存的浅拷贝，
+      // 在这里赋值只动这一份，缓存里那份不受影响。
+      const credits = ensureTraeCnUsage()
+      snapshot.credits = traeCnCreditsInfo(credits)
       void ensureTraeCnKey().then(() => {
         if (!hadTraeCnKey && traeCnKey && currentSource() === 'traecn') refresh()
+        // 积分要拿内存里那批 JWT 去验（200 才算数），所以只能等扫描跑完再发请求。
+        // pull 自带去重与节流，重入到这里只会拿到 false，不会绕成死循环。
+        void credits
+          .pull(traeCnKeyProbe?.tokens ?? [], force)
+          .then((pulled) => {
+            if (pulled && currentSource() === 'traecn') refresh()
+          })
+          .catch(() => undefined)
       })
     } else if (kind === 'opencode-desktop') {
       snapshot = collectOpencodeSnapshot({ opencodeDir: sourceDir(kind), cacheDir: opencodeCacheDir() })
@@ -669,12 +716,24 @@ function bootstrap(): void {
      * 后面那些度量跑的时候真值早就到了，量到的只会是稳定态。
      *
      * 前提是当前源就是 traecn，否则量到的会是别的源（毫秒级，本来就不该有骨架）。
-     * 自检默认源是 workbuddy，所以先切过去，等它进 pending 再量 —— 用切源
-     * 触发而不是改用户设置，免得把人家配置改了不换回来。
+     * 自检默认源是 workbuddy，所以先切过去再量。
+     *
+     * **切源就是改用户设置**：渲染层的 switchSource 走的是
+     * `api.updateSettings({ source })`，不是某个只影响本次会话的旁路。所以这里
+     * 必须自己还原 —— 下面切换循环末尾那个 `patchSettings({ source: sourceBefore })`
+     * 救不了场：它的 sourceBefore 是**在 1200ms 之后**才捕获的，那时设置已经被
+     * 这一段改成 traecn 了，还原等于没还原。用户下次启动会停在一个他从没选过的源上。
      */
     setTimeout(() => {
       const win = mainWindow
       if (!win || win.isDestroyed()) return
+      // 自己动手前先记住原样，还原时只认这一个值 —— 不用下游那个（它捕获得更晚）
+      const sourceAtEntry = settingsStore?.settings.source ?? 'workbuddy'
+      const restore = (): void => {
+        if (settingsStore?.settings.source !== sourceAtEntry) {
+          patchSettings({ source: sourceAtEntry })
+        }
+      }
       const measure = (): void => {
         void win.webContents
           .executeJavaScript(
@@ -690,7 +749,9 @@ function bootstrap(): void {
             smoke('first-paint', {
               ...first,
               // 核心一条：挂着骨架时绝不能同时画着数字 —— 那是「读完了读出 0」
-              ok: (first['blocks'] as number) === 0 || ((first['headline'] as string[]) ?? []).length === 0
+              ok: (first['blocks'] as number) === 0 || ((first['headline'] as string[]) ?? []).length === 0,
+              // 这一段动过用户设置，报告里必须能自证还原回去了
+              restoredFrom: sourceAtEntry
             })
             return win.webContents.capturePage()
           })
@@ -700,8 +761,11 @@ function bootstrap(): void {
             writeFileSync(join(dir, 'window-first-paint.png'), image.toPNG())
           })
           .catch(() => undefined)
+          // 还原放在最后，且**不挂在 measure 的链上**：截图或度量失败时也要还原，
+          // 否则一次自检失败就把用户设置留在 traecn 上
+          .finally(() => restore())
       }
-      if (settingsStore?.settings.source === 'traecn') {
+      if (sourceAtEntry === 'traecn') {
         measure()
       } else {
         void win.webContents
@@ -725,6 +789,9 @@ function bootstrap(): void {
           .then(() => new Promise((resolve) => setTimeout(resolve, SMOKE_FIRST_PAINT_MS)))
           .then(measure)
           .catch(() => undefined)
+          // 中途失败（按钮没找到、窗口没了）同样要还原 —— 这条链上的 catch
+          // 不会走进 measure 的 finally
+          .finally(() => restore())
       }
     }, 1200)
 
@@ -844,7 +911,10 @@ function bootstrap(): void {
             // 切完一轮之后还挂着骨架 —— 分两种情况，判定相反：
             // - traecn：1.5 秒远不够（扫密钥 ~21 秒），这时挂着骨架**是对的**
             // - 其余源：都是毫秒级，真值早该到了，这时还挂着就是漏了
-            if (pendingAfter > 0) {
+            // pendingAfter 是 { blocks, title } 对象，比较必须取 .blocks ——
+            // 直接拿对象跟 0 比会走对象转数字得到 NaN，NaN > 0 恒假，
+            // 于是这一整段永远不进分支，pending.ok 永远为真、什么缺陷都测不出来。
+            if (pendingAfter.blocks > 0) {
               pendingHeld.push({ source: target, title: pendingTitle || '(无标题)' })
               if (target !== 'traecn') stablePendingLeaks.push(target)
             }
